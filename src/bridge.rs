@@ -8,10 +8,128 @@
 //! DSH is not running, or the plugin is not installed, nothing happens and the
 //! shell works exactly as before.
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+
+/// One request from a plugin to the shell.
+///
+/// Separate from `BridgeEvent` because the direction differs: events are the
+/// shell observing DSH, while these are a plugin asking the shell to do
+/// something. Keeping them apart means a plugin cannot spoof an agent event
+/// through the request path, and vice versa.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "method")]
+pub enum ShellRequest {
+    /// Post a desktop notification.
+    Notify {
+        #[serde(default)]
+        title: Option<String>,
+        body: String,
+    },
+    /// Bring the window to the front.
+    FocusWindow,
+    /// Hide the window to the tray.
+    HideWindow,
+    /// Set a short label shown in the tray tooltip.
+    ///
+    /// Deliberately not "set the tray colour": the icon encodes agent state,
+    /// which the shell derives from real events. A plugin overriding that would
+    /// make the tray lie.
+    SetStatusLabel {
+        #[serde(default)]
+        text: Option<String>,
+    },
+}
+
+/// A reply to a `ShellRequest`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShellReply {
+    pub id: String,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl ShellReply {
+    pub fn ok(id: impl Into<String>) -> Self {
+        ShellReply {
+            id: id.into(),
+            ok: true,
+            error: None,
+        }
+    }
+
+    pub fn err(id: impl Into<String>, error: impl Into<String>) -> Self {
+        ShellReply {
+            id: id.into(),
+            ok: false,
+            error: Some(error.into()),
+        }
+    }
+
+    /// The wire form: one JSON object per line.
+    pub fn to_line(&self) -> String {
+        let mut line = serde_json::to_string(self).unwrap_or_else(|_| "{}".into());
+        line.push('\n');
+        line
+    }
+}
+
+/// A line arriving from a plugin, which may be either an event or a request.
+///
+/// The two are distinguished by shape: requests carry `method` and `id`, events
+/// carry `kind`. Parsing tries requests first so a malformed request is reported
+/// rather than silently read as an unknown event.
+#[derive(Debug, Clone)]
+pub enum Incoming {
+    Event(BridgeEvent),
+    Request { id: String, request: ShellRequest },
+    /// A line that looked like a request but could not be parsed.
+    ///
+    /// Carries the id when one was present so the caller can be told its request
+    /// was invalid. Without this the plugin would wait out its full timeout with
+    /// no explanation.
+    BadRequest { id: Option<String>, error: String },
+}
+
+/// Parse one line into either an event or a request.
+pub fn parse_incoming(line: &str) -> Option<Incoming> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    #[derive(Deserialize)]
+    struct Envelope {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        method: Option<String>,
+    }
+
+    if let Ok(envelope) = serde_json::from_str::<Envelope>(trimmed) {
+        if let Some(method) = envelope.method {
+            return match serde_json::from_str::<ShellRequest>(trimmed) {
+                Ok(request) => Some(Incoming::Request {
+                    id: envelope.id.unwrap_or_default(),
+                    request,
+                }),
+                Err(err) => {
+                    tracing::warn!(%err, %method, "malformed shell request");
+                    Some(Incoming::BadRequest {
+                        id: envelope.id,
+                        error: err.to_string(),
+                    })
+                }
+            };
+        }
+    }
+
+    parse_event(trimmed).map(Incoming::Event)
+}
 
 /// One event from the host plugin.
 ///
@@ -93,13 +211,18 @@ pub fn parse_event(line: &str) -> Option<BridgeEvent> {
     serde_json::from_str(trimmed).ok()
 }
 
-/// Listen for bridge events, invoking `on_event` for each one.
+/// Listen for bridge traffic, invoking `on_event` for events and `on_request`
+/// for requests.
 ///
-/// Runs until the process exits. A stale socket file from a previous crash is
-/// removed before binding, otherwise the bind would fail forever.
-pub fn listen<F>(on_event: F) -> std::io::Result<()>
+/// A stale socket file from a previous crash is removed before binding,
+/// otherwise the bind would fail forever.
+///
+/// Each connection is served on its own thread. Requests are answered on the
+/// asking connection, so a reply always reaches the plugin that made the call.
+pub fn listen<E, R>(on_event: E, on_request: R) -> std::io::Result<()>
 where
-    F: Fn(BridgeEvent) + Send + Clone + 'static,
+    E: Fn(BridgeEvent) + Send + Clone + 'static,
+    R: Fn(ShellRequest) -> Result<(), String> + Send + Clone + 'static,
 {
     let path = socket_path();
 
@@ -128,21 +251,55 @@ where
                     }
                 };
                 let on_event = on_event.clone();
-                // One thread per connection: the plugin is a single client, so
-                // this is bounded in practice and keeps reads simple.
+                let on_request = on_request.clone();
                 std::thread::spawn(move || {
+                    // Split so the reader can block on lines while the same
+                    // thread writes replies back.
+                    let writer = match stream.try_clone() {
+                        Ok(writer) => writer,
+                        Err(err) => {
+                            tracing::debug!(%err, "bridge stream clone failed");
+                            return;
+                        }
+                    };
                     let reader = BufReader::new(stream);
                     for line in reader.lines() {
-                        match line {
-                            Ok(line) => {
-                                if let Some(event) = parse_event(&line) {
-                                    on_event(event);
-                                }
-                            }
+                        let line = match line {
+                            Ok(line) => line,
                             Err(err) => {
                                 tracing::debug!(%err, "bridge read ended");
                                 break;
                             }
+                        };
+                        match parse_incoming(&line) {
+                            Some(Incoming::Event(event)) => on_event(event),
+                            Some(Incoming::Request { id, request }) => {
+                                // An unknown id means the plugin sent no id;
+                                // still answer so a caller waiting on a reply
+                                // is not left hanging.
+                                let reply = match on_request(request) {
+                                    Ok(()) => ShellReply::ok(id),
+                                    Err(err) => ShellReply::err(id, err),
+                                };
+                                let mut writer = &writer;
+                                if let Err(err) = writer.write_all(reply.to_line().as_bytes()) {
+                                    tracing::debug!(%err, "bridge reply failed");
+                                    break;
+                                }
+                            }
+                            Some(Incoming::BadRequest { id, error }) => {
+                                // Only answer when the caller supplied an id to
+                                // match on; otherwise there is nobody waiting.
+                                if let Some(id) = id {
+                                    let mut writer = &writer;
+                                    let reply = ShellReply::err(id, format!("invalid request: {error}"));
+                                    if let Err(err) = writer.write_all(reply.to_line().as_bytes()) {
+                                        tracing::debug!(%err, "bridge reply failed");
+                                        break;
+                                    }
+                                }
+                            }
+                            None => {}
                         }
                     }
                 });
@@ -197,6 +354,92 @@ mod tests {
         // Status changes are frequent; notifying on them would be noise.
         assert!(!notify("status"));
         assert!(!notify("created"));
+    }
+
+    #[test]
+    fn parses_a_notify_request() {
+        let line = r#"{"id":"1","method":"notify","body":"hello","title":"DSH"}"#;
+        match parse_incoming(line) {
+            Some(Incoming::Request { id, request }) => {
+                assert_eq!(id, "1");
+                match request {
+                    ShellRequest::Notify { title, body } => {
+                        assert_eq!(title.as_deref(), Some("DSH"));
+                        assert_eq!(body, "hello");
+                    }
+                    other => panic!("expected Notify, got {other:?}"),
+                }
+            }
+            other => panic!("expected a request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn title_is_optional_on_notify() {
+        let line = r#"{"id":"1","method":"notify","body":"hello"}"#;
+        assert!(matches!(
+            parse_incoming(line),
+            Some(Incoming::Request {
+                request: ShellRequest::Notify { title: None, .. },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn an_event_is_not_mistaken_for_a_request() {
+        // Events carry `kind` and no `method`, so they must route to the event
+        // path — otherwise agent updates would be dropped as bad requests.
+        match parse_incoming(r#"{"kind":"status","status":"working"}"#) {
+            Some(Incoming::Event(event)) => assert_eq!(event.kind, "status"),
+            other => panic!("expected an event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_malformed_request_is_reported_back_not_read_as_an_event() {
+        // `method` present but the payload is wrong: it must not silently become
+        // an unknown event, and the caller must be told so it does not hang
+        // until its timeout.
+        match parse_incoming(r#"{"id":"7","method":"notify"}"#) {
+            Some(Incoming::BadRequest { id, error }) => {
+                assert_eq!(id.as_deref(), Some("7"));
+                assert!(!error.is_empty(), "no explanation for the caller");
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+
+        // An unknown method is also reported rather than dropped.
+        assert!(matches!(
+            parse_incoming(r#"{"id":"8","method":"no-such-method"}"#),
+            Some(Incoming::BadRequest { .. })
+        ));
+    }
+
+    #[test]
+    fn a_bad_request_without_an_id_is_still_not_an_event() {
+        // Nothing to reply to, but it must not be misread as a bridge event.
+        match parse_incoming(r#"{"method":"notify"}"#) {
+            Some(Incoming::BadRequest { id, .. }) => assert!(id.is_none()),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replies_serialise_as_one_line() {
+        let line = ShellReply::ok("42").to_line();
+        assert!(line.ends_with('\n'), "reply must be newline-terminated");
+        assert_eq!(line.matches('\n').count(), 1, "reply must be a single line");
+        let parsed: serde_json::Value = serde_json::from_str(line.trim()).expect("valid json");
+        assert_eq!(parsed["id"], "42");
+        assert_eq!(parsed["ok"], true);
+        // A successful reply omits the error field entirely.
+        assert!(parsed.get("error").is_none());
+
+        let err = ShellReply::err("43", "nope").to_line();
+        let parsed: serde_json::Value = serde_json::from_str(err.trim()).unwrap();
+        assert_eq!(parsed["ok"], false);
+        assert_eq!(parsed["error"], "nope");
     }
 
     #[test]

@@ -102,9 +102,22 @@ fn main() {
     // The bridge listener runs on its own thread; events are funnelled to the
     // UI thread over a channel, because tray APIs are main-thread-only.
     let (bridge_tx, bridge_rx) = std::sync::mpsc::channel::<bridge::BridgeEvent>();
-    if let Err(err) = bridge::listen(move |event| {
-        let _ = bridge_tx.send(event);
-    }) {
+    // Requests a plugin makes of the shell are forwarded to the UI thread for
+    // the same reason events are: they touch main-thread-only objects.
+    let (request_tx, request_rx) = std::sync::mpsc::channel::<bridge::ShellRequest>();
+    let request_tx_for_handler = request_tx.clone();
+    if let Err(err) = bridge::listen(
+        move |event| {
+            let _ = bridge_tx.send(event);
+        },
+        move |request| {
+            // The UI thread answers; the listener thread only carries the reply
+            // back. A closed channel means the shell is shutting down.
+            request_tx_for_handler
+                .send(request)
+                .map_err(|_| "shell is shutting down".to_string())
+        },
+    ) {
         tracing::warn!(%err, "bridge unavailable; tray and notifications will stay idle");
     }
 
@@ -119,7 +132,7 @@ fn main() {
 
     // Global summon shortcut. Optional: if another app owns the combination the
     // shell still runs, it just cannot be summoned while hidden.
-    let hotkey = native::register_hotkey(None);
+    let mut hotkey = native::register_hotkey(initial_hotkey_spec(&theme_source));
     let hotkey_rx = global_hotkey::GlobalHotKeyEvent::receiver().clone();
 
     // The application menu.
@@ -254,6 +267,30 @@ fn main() {
                     tracing::warn!(%err, "could not apply theme to page");
                 }
             }
+
+            // Hotkey changes ride the same reload. A rejected shortcut leaves
+            // the previous one registered, so the user is never left without a
+            // way to summon the window.
+            if let Some(active) = hotkey.as_mut() {
+                match native::HotkeySpec::parse(&theme.hotkey) {
+                    Ok(spec) => match active.retarget(spec) {
+                        Ok(()) => tracing::info!(
+                            shortcut = %active.spec().to_string_canonical(),
+                            "hotkey updated"
+                        ),
+                        Err(err) => tracing::warn!(
+                            %err,
+                            keeping = %active.spec().to_string_canonical(),
+                            "hotkey change rejected; previous shortcut kept"
+                        ),
+                    },
+                    Err(err) => tracing::warn!(
+                        shortcut = %theme.hotkey,
+                        %err,
+                        "invalid hotkey; previous shortcut kept"
+                    ),
+                }
+            }
             // `tao::window::RGBA` is a plain (r, g, b, a) tuple, which is what
             // `hex_to_rgba` already produces.
             window.set_background_color(Some(hex_to_rgba(
@@ -338,6 +375,45 @@ fn main() {
                     window.set_minimized(false);
                     window.set_focus();
                     tracing::info!("summoned by global hotkey");
+                }
+            }
+        }
+
+        // --- Shell requests from plugins ----------------------------------
+        //
+        // A plugin asking the shell to do something. Each maps onto a native
+        // action the UI thread owns.
+        while let Ok(request) = request_rx.try_recv() {
+            match request {
+                bridge::ShellRequest::Notify { title, body } => {
+                    native::notify(
+                        title.as_deref().unwrap_or("DSH"),
+                        &body,
+                    );
+                }
+                bridge::ShellRequest::FocusWindow => {
+                    window.set_visible(true);
+                    window.set_minimized(false);
+                    window.set_focus();
+                }
+                bridge::ShellRequest::HideWindow => {
+                    window.set_visible(false);
+                }
+                bridge::ShellRequest::SetStatusLabel { text } => {
+                    // Only the label is plugin-controlled; the icon colour stays
+                    // derived from real agent state so the tray cannot lie.
+                    match text {
+                        Some(text) => {
+                            if let Some(active) = tray.as_mut() {
+                                active.set_plugin_label(Some(text));
+                            }
+                        }
+                        None => {
+                            if let Some(active) = tray.as_mut() {
+                                active.set_plugin_label(None);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -470,6 +546,25 @@ fn short_session(id: &str) -> String {
         format!("{head}…")
     } else {
         head
+    }
+}
+
+/// Parse the configured shortcut, falling back to the default.
+///
+/// A malformed entry must not leave the user without a hotkey, so the default is
+/// used and the problem logged.
+fn initial_hotkey_spec(theme_source: &ThemeSource) -> native::HotkeySpec {
+    let text = theme_source.current().hotkey.clone();
+    match native::HotkeySpec::parse(&text) {
+        Ok(spec) => spec,
+        Err(err) => {
+            tracing::warn!(
+                shortcut = %text,
+                %err,
+                "invalid hotkey in theme.json; using the default"
+            );
+            native::HotkeySpec::default_spec()
+        }
     }
 }
 

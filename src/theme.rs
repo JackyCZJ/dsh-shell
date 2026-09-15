@@ -130,6 +130,12 @@ pub struct Theme {
     /// Palette used when the resolved appearance is dark.
     #[serde(default = "Palette::deepseek_dark")]
     pub dark: Palette,
+    /// The global shortcut that summons the window, e.g. `"meta+shift+D"`.
+    ///
+    /// A string rather than a structured value so the file stays readable and a
+    /// typo is reported as text. Validated on load; see `HotkeySpec::parse`.
+    #[serde(default = "default_hotkey_text")]
+    pub hotkey: String,
     /// Inset of the traffic lights from the window's top-left, in CSS pixels.
     pub traffic_light_inset: TrafficLightInset,
     /// Extra CSS appended to the injected block, for quick experiments.
@@ -143,10 +149,16 @@ pub struct TrafficLightInset {
     pub y: f64,
 }
 
+/// The shipped default shortcut.
+fn default_hotkey_text() -> String {
+    "meta+shift+D".to_string()
+}
+
 impl Default for Theme {
     fn default() -> Self {
         Theme {
             appearance: Appearance::System,
+            hotkey: default_hotkey_text(),
             light: Palette::deepseek_light(),
             dark: Palette::deepseek_dark(),
             // Matches the default macOS inset so the buttons look native until

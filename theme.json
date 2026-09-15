@@ -1,5 +1,6 @@
 {
   "appearance": "system",
+  "hotkey": "meta+shift+D",
   "light": {
     "background": "#ffffff",
     "surface": "#f5f6f7",
@@ -20,6 +21,9 @@
     "accent": "#4176e6",
     "caption_height": 34
   },
-  "traffic_light_inset": { "x": 20.0, "y": 20.0 },
+  "traffic_light_inset": {
+    "x": 20.0,
+    "y": 20.0
+  },
   "custom_css": "/* Extra CSS applied after the generated rules. */"
 }

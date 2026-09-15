@@ -65,6 +65,8 @@ pub struct Tray {
     show_item: MenuItem,
     quit_item: MenuItem,
     pub state: AgentState,
+    /// A short label contributed by a plugin, shown after the agent state.
+    plugin_label: Option<String>,
 }
 
 impl Tray {
@@ -99,6 +101,7 @@ impl Tray {
             show_item,
             quit_item,
             state: AgentState::Idle,
+            plugin_label: None,
         })
     }
 
@@ -108,8 +111,32 @@ impl Tray {
             return;
         }
         self.state = state;
-        self.state_item.set_text(format!("Agent: {}", state.label()));
+        self.refresh_label();
         let _ = self._icon.set_icon(Some(make_icon(state)));
+    }
+
+    /// Set or clear the plugin-contributed label.
+    ///
+    /// Only text is plugin-controlled: the icon colour stays derived from real
+    /// agent state, so a plugin cannot make the tray misrepresent what the
+    /// agent is doing.
+    pub fn set_plugin_label(&mut self, label: Option<String>) {
+        let label = sanitize_label(label);
+        if self.plugin_label == label {
+            return;
+        }
+        self.plugin_label = label;
+        self.refresh_label();
+    }
+
+/// Recompute the tray text from the agent state and any plugin label.
+    fn refresh_label(&mut self) {
+        let text = match &self.plugin_label {
+            Some(label) => format!("Agent: {} — {label}", self.state.label()),
+            None => format!("Agent: {}", self.state.label()),
+        };
+        self.state_item.set_text(text.clone());
+        let _ = self._icon.set_tooltip(Some(text));
     }
 
     pub fn show_item_id(&self) -> &tray_icon::menu::MenuId {
@@ -464,6 +491,25 @@ mod tests {
     }
 
     #[test]
+    fn plugin_labels_are_sanitised() {
+        // A plugin-supplied label must not break the tooltip layout or flood it.
+        let long = "x".repeat(200);
+        let cleaned = sanitize_label(Some(long));
+        let cleaned = cleaned.expect("long label survives, truncated");
+        assert!(cleaned.chars().count() <= 60, "label not truncated: {}", cleaned.len());
+
+        // Newlines would break the single-line menu text.
+        let multiline = sanitize_label(Some("a\nb\tc".into())).unwrap();
+        assert!(!multiline.contains('\n') && !multiline.contains('\t'), "{multiline:?}");
+
+        // Whitespace-only and empty labels clear the field rather than showing
+        // an empty separator in the menu.
+        assert_eq!(sanitize_label(Some("   ".into())), None);
+        assert_eq!(sanitize_label(Some(String::new())), None);
+        assert_eq!(sanitize_label(None), None);
+    }
+
+    #[test]
     fn generated_icon_has_the_expected_buffer() {
         let icon = make_icon(AgentState::Working);
         // Construction is the assertion: from_rgba rejects a wrong length.
@@ -471,13 +517,94 @@ mod tests {
     }
 
     #[test]
+    fn parses_hotkey_strings() {
+        let spec = HotkeySpec::parse("meta+shift+D").expect("parse");
+        assert_eq!(spec.key, HotkeyKey::D);
+        assert!(spec.mods.contains(&HotkeyMod::Meta));
+        assert!(spec.mods.contains(&HotkeyMod::Shift));
+    }
+
+    #[test]
+    fn hotkey_parsing_is_tolerant_of_spelling_and_order() {
+        let a = HotkeySpec::parse("meta+shift+D").unwrap();
+        // Case, whitespace, ordering, and the platform aliases all normalise to
+        // the same shortcut, so a user copying from any convention works.
+        for variant in [
+            "META+SHIFT+D",
+            " D + shift + meta ",
+            "cmd+shift+d",
+            "command+shift+d",
+            "super+shift+d",
+        ] {
+            assert_eq!(
+                HotkeySpec::parse(variant).unwrap(),
+                a,
+                "{variant} did not normalise to the same shortcut"
+            );
+        }
+        assert_eq!(
+            HotkeySpec::parse("alt+f4").unwrap(),
+            HotkeySpec {
+                mods: vec![HotkeyMod::Alt],
+                key: HotkeyKey::F4
+            }
+        );
+    }
+
+    #[test]
+    fn hotkey_requires_a_modifier() {
+        // A bare letter as a global shortcut would swallow that key everywhere.
+        let err = HotkeySpec::parse("D").unwrap_err();
+        assert!(err.contains("no modifier"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn hotkey_rejects_malformed_input() {
+        for bad in [
+            "",                 // empty
+            "meta+",            // dangling separator
+            "+d",               // leading separator
+            "meta+meta+d",      // duplicate modifier
+            "meta+nope",        // not a key we accept
+            "meta+shift+d+x",   // two keys
+        ] {
+            assert!(
+                HotkeySpec::parse(bad).is_err(),
+                "{bad:?} should have been rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn hotkey_round_trips_through_its_canonical_form() {
+        for text in ["meta+shift+D", "alt+F4", "control+space", "meta+1"] {
+            let spec = HotkeySpec::parse(text).unwrap();
+            let canonical = spec.to_string_canonical();
+            assert_eq!(
+                HotkeySpec::parse(&canonical).unwrap(),
+                spec,
+                "{text} did not round trip via {canonical}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_hotkey_is_the_documented_shortcut() {
+        assert_eq!(HotkeySpec::default_spec().to_string_canonical(), "meta+shift+D");
+    }
+
+    #[test]
     fn the_summon_hotkey_does_not_collide_with_common_shortcuts() {
         use global_hotkey::hotkey::{Code, Modifiers};
-        let hk = default_hotkey();
+        let hk = HotkeySpec::default_spec().to_hotkey();
         assert_eq!(hk.key, Code::KeyD);
         // Cmd-D alone is a common app shortcut ("Don't Save"); requiring Shift
         // keeps the default out of the way.
-        assert!(hk.mods.contains(Modifiers::SUPER));
+        //
+        // `Modifiers::META` is what this crate accepts for the platform Command
+        // key: global-hotkey maps `SUPER | META` onto the same native flag, so
+        // either spelling registers Command on macOS.
+        assert!(hk.mods.intersects(Modifiers::META | Modifiers::SUPER));
         assert!(hk.mods.contains(Modifiers::SHIFT));
     }
 }
@@ -512,6 +639,25 @@ pub fn tray_command(event: &MenuEvent, tray: &Tray) -> Option<TrayCommand> {
         Some(TrayCommand::Quit)
     } else {
         None
+    }
+}
+
+/// Normalise a plugin-supplied tray label.
+///
+/// Flattened to one line and length-capped: a tooltip cannot show newlines, and
+/// without a cap a plugin could flood the menu. Whitespace-only input clears the
+/// label rather than leaving a stray separator.
+pub fn sanitize_label(label: Option<String>) -> Option<String> {
+    let flat = label?.replace(char::is_whitespace, " ");
+    let trimmed = flat.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.chars().count() > 60 {
+        let head: String = trimmed.chars().take(59).collect();
+        Some(format!("{head}…"))
+    } else {
+        Some(trimmed.to_string())
     }
 }
 
@@ -601,22 +747,49 @@ pub fn system_is_dark() -> bool {
     false
 }
 
-/// A registered global hotkey.
+/// A registered global hotkey, re-targetable at runtime.
 ///
-/// Held for the lifetime of the app: dropping the manager unregisters the
-/// shortcut, so it must outlive the event loop.
+/// Holds the manager for the lifetime of the app: dropping it unregisters the
+/// shortcut. Kept in one place so a live config change can swap the combination
+/// without tearing the manager down.
 pub struct HotKeyHandle {
-    _manager: global_hotkey::GlobalHotKeyManager,
-    pub hotkey: global_hotkey::hotkey::HotKey,
+    manager: global_hotkey::GlobalHotKeyManager,
+    hotkey: global_hotkey::hotkey::HotKey,
+    spec: HotkeySpec,
 }
 
-/// The shortcut that summons the window.
-///
-/// Chosen to avoid collisions with common system and app shortcuts:
-/// Cmd-Shift-D is not taken by macOS by default, and "D" matches DSH.
-pub fn default_hotkey() -> global_hotkey::hotkey::HotKey {
-    use global_hotkey::hotkey::{Code, HotKey, Modifiers};
-    HotKey::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::KeyD)
+impl HotKeyHandle {
+    /// The active shortcut.
+    pub fn hotkey(&self) -> &global_hotkey::hotkey::HotKey {
+        &self.hotkey
+    }
+
+    /// The active shortcut as written in the config.
+    pub fn spec(&self) -> &HotkeySpec {
+        &self.spec
+    }
+
+    /// Switch to a different combination.
+    ///
+    /// Registration happens **before** the old one is released, so a
+    /// combination owned by another app is rejected without ever leaving the
+    /// user without a working hotkey. On success the previous one is dropped.
+    pub fn retarget(&mut self, spec: HotkeySpec) -> Result<(), String> {
+        if spec == self.spec {
+            return Ok(()); // Nothing to do; avoids a needless unregister window.
+        }
+
+        let candidate = spec.to_hotkey();
+        self.manager
+            .register(candidate)
+            .map_err(|err| format!("{} is unavailable: {err}", spec.to_string_canonical()))?;
+
+        // The new one is registered, so releasing the old one cannot leave a gap.
+        let _ = self.manager.unregister(self.hotkey);
+        self.hotkey = candidate;
+        self.spec = spec;
+        Ok(())
+    }
 }
 
 /// Register the summon shortcut.
@@ -624,7 +797,7 @@ pub fn default_hotkey() -> global_hotkey::hotkey::HotKey {
 /// Returns `None` when registration fails — usually because another app already
 /// owns the combination. Losing the hotkey must not cost the user the window,
 /// so this is reported and the shell continues.
-pub fn register_hotkey(spec: Option<global_hotkey::hotkey::HotKey>) -> Option<HotKeyHandle> {
+pub fn register_hotkey(spec: HotkeySpec) -> Option<HotKeyHandle> {
     use global_hotkey::GlobalHotKeyManager;
 
     let manager = match GlobalHotKeyManager::new() {
@@ -635,19 +808,21 @@ pub fn register_hotkey(spec: Option<global_hotkey::hotkey::HotKey>) -> Option<Ho
         }
     };
 
-    let hotkey = spec.unwrap_or_else(default_hotkey);
+    let hotkey = spec.to_hotkey();
     if let Err(err) = manager.register(hotkey) {
         tracing::warn!(
+            shortcut = %spec.to_string_canonical(),
             %err,
             "could not register the global hotkey; it may be taken by another app"
         );
         return None;
     }
 
-    tracing::info!(?hotkey, "global hotkey registered");
+    tracing::info!(shortcut = %spec.to_string_canonical(), "global hotkey registered");
     Some(HotKeyHandle {
-        _manager: manager,
+        manager,
         hotkey,
+        spec,
     })
 }
 
@@ -656,5 +831,220 @@ pub fn is_summon_event(
     event: &global_hotkey::GlobalHotKeyEvent,
     handle: &HotKeyHandle,
 ) -> bool {
-    event.id == handle.hotkey.id()
+    event.id == handle.hotkey().id()
+}
+
+/// A configurable keyboard shortcut, as written in `theme.json`.
+///
+/// Stored as text (`"meta+shift+D"`) rather than a serialized enum so the file
+/// stays readable and a typo produces a clear parse error instead of a silently
+/// ignored field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HotkeySpec {
+    pub mods: Vec<HotkeyMod>,
+    pub key: HotkeyKey,
+}
+
+/// Modifier keys accepted in a shortcut string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotkeyMod {
+    Meta,
+    Shift,
+    Alt,
+    Control,
+}
+
+/// A key accepted in a shortcut string.
+///
+/// Deliberately a whitelist rather than free text: an arbitrary key name would
+/// have to map onto the platform's key codes anyway, and a wrong entry would
+/// fail at registration with a less useful message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotkeyKey {
+    A, B, C, D, E, F, G, H, I, J, K, L, M,
+    N, O, P, Q, R, S, T, U, V, W, X, Y, Z,
+    Digit0, Digit1, Digit2, Digit3, Digit4,
+    Digit5, Digit6, Digit7, Digit8, Digit9,
+    Space, Enter, Escape, Tab,
+    F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12,
+}
+
+impl HotkeySpec {
+    /// The default: ⌘⇧D.
+    ///
+    /// Shift is required because ⌘D alone is a common in-app shortcut.
+    pub fn default_spec() -> HotkeySpec {
+        HotkeySpec {
+            mods: vec![HotkeyMod::Meta, HotkeyMod::Shift],
+            key: HotkeyKey::D,
+        }
+    }
+
+    /// Parse `"meta+shift+D"`.
+    ///
+    /// Case-insensitive, tolerant of surrounding whitespace, and the key may
+    /// appear in any position. At least one modifier is **required**: a bare
+    /// letter as a global shortcut would swallow that key system-wide.
+    pub fn parse(text: &str) -> Result<HotkeySpec, String> {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return Err("shortcut is empty".into());
+        }
+
+        let mut mods = Vec::new();
+        let mut key = None;
+
+        for part in trimmed.split('+') {
+            let token = part.trim();
+            if token.is_empty() {
+                return Err(format!("empty component in {trimmed:?}"));
+            }
+            let lower = token.to_ascii_lowercase();
+            let modifier = match lower.as_str() {
+                "meta" | "cmd" | "command" | "super" | "win" => Some(HotkeyMod::Meta),
+                "shift" => Some(HotkeyMod::Shift),
+                "alt" | "option" | "opt" => Some(HotkeyMod::Alt),
+                "control" | "ctrl" => Some(HotkeyMod::Control),
+                _ => None,
+            };
+            match modifier {
+                Some(m) => {
+                    if mods.contains(&m) {
+                        return Err(format!("duplicate modifier {:?} in {trimmed:?}", m));
+                    }
+                    mods.push(m);
+                }
+                None => {
+                    if key.is_some() {
+                        return Err(format!("more than one key in {trimmed:?}"));
+                    }
+                    key = Some(parse_key(&lower)?);
+                }
+            }
+        }
+
+        let key = key.ok_or_else(|| format!("no key in {trimmed:?}"))?;
+        if mods.is_empty() {
+            return Err(format!(
+                "{trimmed:?} has no modifier; a global shortcut needs at least one"
+            ));
+        }
+        // Normalise modifier order so two spellings of the same shortcut compare
+        // equal. `retarget` relies on that comparison to skip no-op changes.
+        mods.sort_by_key(|m| match m {
+            HotkeyMod::Control => 0,
+            HotkeyMod::Alt => 1,
+            HotkeyMod::Shift => 2,
+            HotkeyMod::Meta => 3,
+        });
+        Ok(HotkeySpec { mods, key })
+    }
+
+    /// Render back to the canonical string form.
+    pub fn to_string_canonical(&self) -> String {
+        let mut parts: Vec<String> = self
+            .mods
+            .iter()
+            .map(|m| {
+                match m {
+                    HotkeyMod::Meta => "meta",
+                    HotkeyMod::Shift => "shift",
+                    HotkeyMod::Alt => "alt",
+                    HotkeyMod::Control => "control",
+                }
+                .to_string()
+            })
+            .collect();
+        parts.push(key_token(self.key).to_string());
+        parts.join("+")
+    }
+
+    /// Convert to the platform hotkey type.
+    pub fn to_hotkey(&self) -> global_hotkey::hotkey::HotKey {
+        use global_hotkey::hotkey::{HotKey, Modifiers};
+        let mut mods = Modifiers::empty();
+        for m in &self.mods {
+            mods |= match m {
+                HotkeyMod::Meta => Modifiers::META,
+                HotkeyMod::Shift => Modifiers::SHIFT,
+                HotkeyMod::Alt => Modifiers::ALT,
+                HotkeyMod::Control => Modifiers::CONTROL,
+            };
+        }
+        HotKey::new(Some(mods), code_for(self.key))
+    }
+}
+
+/// The canonical text for a key, matching what `parse_key` accepts.
+fn key_token(key: HotkeyKey) -> &'static str {
+    use HotkeyKey::*;
+    match key {
+        A => "A", B => "B", C => "C", D => "D", E => "E", F => "F",
+        G => "G", H => "H", I => "I", J => "J", K => "K", L => "L",
+        M => "M", N => "N", O => "O", P => "P", Q => "Q", R => "R",
+        S => "S", T => "T", U => "U", V => "V", W => "W", X => "X",
+        Y => "Y", Z => "Z",
+        Digit0 => "0", Digit1 => "1", Digit2 => "2", Digit3 => "3",
+        Digit4 => "4", Digit5 => "5", Digit6 => "6", Digit7 => "7",
+        Digit8 => "8", Digit9 => "9",
+        Space => "Space", Enter => "Enter", Escape => "Escape", Tab => "Tab",
+        F1 => "F1", F2 => "F2", F3 => "F3", F4 => "F4",
+        F5 => "F5", F6 => "F6", F7 => "F7", F8 => "F8",
+        F9 => "F9", F10 => "F10", F11 => "F11", F12 => "F12",
+    }
+}
+
+/// Map a parsed key onto the platform key code.
+fn code_for(key: HotkeyKey) -> global_hotkey::hotkey::Code {
+    use global_hotkey::hotkey::Code;
+    match key {
+        HotkeyKey::A => Code::KeyA, HotkeyKey::B => Code::KeyB,
+        HotkeyKey::C => Code::KeyC, HotkeyKey::D => Code::KeyD,
+        HotkeyKey::E => Code::KeyE, HotkeyKey::F => Code::KeyF,
+        HotkeyKey::G => Code::KeyG, HotkeyKey::H => Code::KeyH,
+        HotkeyKey::I => Code::KeyI, HotkeyKey::J => Code::KeyJ,
+        HotkeyKey::K => Code::KeyK, HotkeyKey::L => Code::KeyL,
+        HotkeyKey::M => Code::KeyM, HotkeyKey::N => Code::KeyN,
+        HotkeyKey::O => Code::KeyO, HotkeyKey::P => Code::KeyP,
+        HotkeyKey::Q => Code::KeyQ, HotkeyKey::R => Code::KeyR,
+        HotkeyKey::S => Code::KeyS, HotkeyKey::T => Code::KeyT,
+        HotkeyKey::U => Code::KeyU, HotkeyKey::V => Code::KeyV,
+        HotkeyKey::W => Code::KeyW, HotkeyKey::X => Code::KeyX,
+        HotkeyKey::Y => Code::KeyY, HotkeyKey::Z => Code::KeyZ,
+        HotkeyKey::Digit0 => Code::Digit0, HotkeyKey::Digit1 => Code::Digit1,
+        HotkeyKey::Digit2 => Code::Digit2, HotkeyKey::Digit3 => Code::Digit3,
+        HotkeyKey::Digit4 => Code::Digit4, HotkeyKey::Digit5 => Code::Digit5,
+        HotkeyKey::Digit6 => Code::Digit6, HotkeyKey::Digit7 => Code::Digit7,
+        HotkeyKey::Digit8 => Code::Digit8, HotkeyKey::Digit9 => Code::Digit9,
+        HotkeyKey::Space => Code::Space, HotkeyKey::Enter => Code::Enter,
+        HotkeyKey::Escape => Code::Escape, HotkeyKey::Tab => Code::Tab,
+        HotkeyKey::F1 => Code::F1, HotkeyKey::F2 => Code::F2,
+        HotkeyKey::F3 => Code::F3, HotkeyKey::F4 => Code::F4,
+        HotkeyKey::F5 => Code::F5, HotkeyKey::F6 => Code::F6,
+        HotkeyKey::F7 => Code::F7, HotkeyKey::F8 => Code::F8,
+        HotkeyKey::F9 => Code::F9, HotkeyKey::F10 => Code::F10,
+        HotkeyKey::F11 => Code::F11, HotkeyKey::F12 => Code::F12,
+    }
+}
+
+/// Parse a single key token.
+fn parse_key(token: &str) -> Result<HotkeyKey, String> {
+    use HotkeyKey::*;
+    let key = match token {
+        "a" => A, "b" => B, "c" => C, "d" => D, "e" => E, "f" => F,
+        "g" => G, "h" => H, "i" => I, "j" => J, "k" => K, "l" => L,
+        "m" => M, "n" => N, "o" => O, "p" => P, "q" => Q, "r" => R,
+        "s" => S, "t" => T, "u" => U, "v" => V, "w" => W, "x" => X,
+        "y" => Y, "z" => Z,
+        "0" => Digit0, "1" => Digit1, "2" => Digit2, "3" => Digit3,
+        "4" => Digit4, "5" => Digit5, "6" => Digit6, "7" => Digit7,
+        "8" => Digit8, "9" => Digit9,
+        "space" => Space, "enter" | "return" => Enter,
+        "escape" | "esc" => Escape, "tab" => Tab,
+        "f1" => F1, "f2" => F2, "f3" => F3, "f4" => F4,
+        "f5" => F5, "f6" => F6, "f7" => F7, "f8" => F8,
+        "f9" => F9, "f10" => F10, "f11" => F11, "f12" => F12,
+        other => return Err(format!("unknown key {other:?}")),
+    };
+    Ok(key)
 }
