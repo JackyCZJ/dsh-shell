@@ -342,6 +342,12 @@ fn main() {
     // the system remembers the answer.
     let mut asked_for_notifications = false;
 
+    // Finished turns the user has not looked at yet, shown as a Dock badge.
+    // The window is focused when it opens, so this starts settled rather than
+    // showing a badge for work nobody has missed.
+    let mut unseen: usize = 0;
+    let mut window_focused = true;
+
     let mut last_geometry = restored;
     let mut geometry_dirty = false;
     let mut geometry_written_at = std::time::Instant::now();
@@ -670,6 +676,18 @@ fn main() {
                     ),
                 };
                 native::notify(theme_source.locale(), &title, &body);
+
+                // A turn that finishes while the user is looking at the window
+                // needs no badge; one that finishes behind something else does.
+                // The notification is posted either way — it is what carries
+                // *what* happened, and it is what the user asked to be told.
+                // Hiding to the tray does not reliably deliver a focus-lost
+                // event, so visibility is checked too — a hidden window is
+                // never being watched.
+                if !window_focused || !window.is_visible() {
+                    unseen += 1;
+                    native::set_dock_badge(Some(unseen));
+                }
             }
         }
 
@@ -755,6 +773,19 @@ fn main() {
                 ..
             } => {
                 geometry_dirty = true;
+            }
+            // Looking at the window is what "seen" means, so the badge clears
+            // here rather than on a timer or on any particular click.
+            Event::WindowEvent {
+                event: WindowEvent::Focused(focused),
+                ..
+            } => {
+                window_focused = focused;
+                if focused && unseen > 0 {
+                    unseen = 0;
+                    native::set_dock_badge(None);
+                    tracing::debug!("dock badge cleared on focus");
+                }
             }
             // macOS only. Clicking the dock icon while the window is hidden must
             // bring it back: the window hides to the tray on close, so without

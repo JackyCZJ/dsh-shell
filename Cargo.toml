@@ -50,6 +50,14 @@ objc2 = "0.6"
 objc2-foundation = "0.3"
 objc2-user-notifications = "0.3"
 block2 = "0.6"
+# For the Dock badge. AppKit already arrives transitively through tao, muda and
+# tray-icon; naming the two classes directly avoids enabling its thousand-entry
+# default feature set for bindings this crate never touches.
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSApplication",
+    "NSDockTile",
+] }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 notify-rust = "4"

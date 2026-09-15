@@ -474,6 +474,23 @@ mod tests {
 
     #[test]
     #[test]
+    fn no_badge_is_shown_for_nothing_to_report() {
+        assert_eq!(dock_badge_label(None), None);
+        assert_eq!(dock_badge_label(Some(0)), None);
+    }
+
+    #[test]
+    fn the_badge_counts_up_to_a_cap() {
+        assert_eq!(dock_badge_label(Some(1)).as_deref(), Some("1"));
+        assert_eq!(dock_badge_label(Some(42)).as_deref(), Some("42"));
+        assert_eq!(dock_badge_label(Some(99)).as_deref(), Some("99"));
+        // Beyond the cap the exact number stops being useful and the pill
+        // would start crowding the icon.
+        assert_eq!(dock_badge_label(Some(100)).as_deref(), Some("99+"));
+        assert_eq!(dock_badge_label(Some(9999)).as_deref(), Some("99+"));
+    }
+
+    #[test]
     fn the_icon_has_retina_pixels_to_spare() {
         // tray-icon fits the image to 18 points, so a bitmap smaller than 36
         // pixels is upscaled and looks soft. This is the regression that made
@@ -699,6 +716,52 @@ pub fn prepare_notifications() {
             UNAuthorizationOptions::Alert | UNAuthorizationOptions::Sound,
             &answered,
         );
+    }
+}
+
+/// Show, change, or clear the Dock badge.
+///
+/// `None` clears it. A numeric badge is passed through as digits rather than
+/// drawn here, so the Dock keeps its own styling, sizing and accessibility.
+/// Saturates rather than growing without bound: past a point the exact count
+/// stops being useful and the pill starts crowding the icon.
+///
+/// A no-op where the platform has no Dock.
+pub fn set_dock_badge(count: Option<usize>) {
+    let label = dock_badge_label(count);
+
+    #[cfg(target_os = "macos")]
+    {
+        use objc2_app_kit::NSApplication;
+        use objc2_foundation::{MainThreadMarker, NSString};
+
+        // AppKit is main-thread-only. Every caller runs on the event loop, so
+        // this is a guard rather than a real possibility.
+        let Some(mtm) = MainThreadMarker::new() else {
+            tracing::debug!("dock badge skipped: not on the main thread");
+            return;
+        };
+        let label = label.as_deref().map(NSString::from_str);
+        NSApplication::sharedApplication(mtm)
+            .dockTile()
+            .setBadgeLabel(label.as_deref());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    let _ = label;
+}
+
+/// The badge text for a count, or `None` to leave the Dock unbadged.
+///
+/// Split out from the AppKit call so the rule can be tested without a Dock.
+fn dock_badge_label(count: Option<usize>) -> Option<String> {
+    /// Past this the exact number stops being useful and the pill starts
+    /// crowding the icon.
+    const MAX_SHOWN: usize = 99;
+    match count {
+        Some(n) if n > MAX_SHOWN => Some(format!("{MAX_SHOWN}+")),
+        Some(0) | None => None,
+        Some(n) => Some(n.to_string()),
     }
 }
 

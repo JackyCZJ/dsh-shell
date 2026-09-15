@@ -47,6 +47,7 @@ runtime it was trying to avoid in the first place.
 | **Single instance** | A second launch raises the running window instead of starting a second shell |
 | **Remembers the window** | Size, position, and zoom come back on the next launch |
 | **Dock reopen** | Clicking the dock icon restores a hidden or minimized window |
+| **Dock badge** | A red count of finished turns you have not looked at; clears when the window regains focus |
 | **Plugin bridge** | A real DSH Host plugin forwards `agent/*` events to the shell |
 
 ## Requirements
