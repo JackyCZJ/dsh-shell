@@ -439,6 +439,7 @@ Everything below was exercised against a real DSH install on macOS 26 (arm64):
 | **Handoff raises** | Window minimized → second launch → un-minimized, not merely focused |
 | **Window state** | Resized to 1000×640 at (300, 120), `kill -9`'d, relaunched at exactly that rectangle |
 | **Dock reopen** | Window minimized → `open -a` (the reopen event) → `AXMinimized` `true` → `false` |
+| **Notification permission** | `requestAuthorization` returned *granted*; the previous backend never registered the app at all |
 
 ## Known gaps
 
@@ -457,6 +458,14 @@ Everything below was exercised against a real DSH install on macOS 26 (arm64):
 - **No auto-update.** A new build has to be installed by hand.
 - **Language changes need a restart** for the tray and the app menu, which are
   built once at startup. The settings window picks up a change when reopened.
+- **A notification banner has not been seen on screen.** Permission is granted
+  and the system accepts the request without error, but no banner was caught in
+  any configuration testable without restarting the app that was hosting the
+  session. Confirm it after a restart.
+- **A shell-script launcher breaks notifications.** With a wrapper as
+  `CFBundleExecutable`, `usernotificationsd` reports *"Couldn't get record to
+  check entitlement key"* and refuses the request, however the bundle is signed.
+  The shipped app has no wrapper, so this only bites when testing.
 
 ## Licence
 

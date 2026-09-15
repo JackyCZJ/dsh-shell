@@ -578,11 +578,86 @@ mod tests {
     }
 }
 
+/// Render an `NSError` for a log line.
+///
+/// The API reports failure through this pointer and nothing else, so an
+/// unhelpful message here is indistinguishable from the silent failure this
+/// whole path replaced.
+#[cfg(target_os = "macos")]
+fn describe_ns_error(err: *mut objc2_foundation::NSError) -> String {
+    if err.is_null() {
+        return "no error given".to_string();
+    }
+    // SAFETY: the caller hands us a pointer that is valid for the duration of
+    // the callback.
+    let err = unsafe { &*err };
+    format!(
+        "{} ({} {})",
+        err.localizedDescription(),
+        err.domain(),
+        err.code()
+    )
+}
+
+/// Ask the system for permission to notify, once, at startup.
+///
+/// `UNUserNotificationCenter` delivers nothing until the user has allowed it,
+/// and the first request raises a system prompt. Asking at launch puts that
+/// prompt in front of someone who has just opened the app, rather than in front
+/// of the first "the agent finished" notification — which would otherwise be
+/// swallowed by the prompt it triggered.
+///
+/// A no-op where the platform has no permission model.
+pub fn prepare_notifications() {
+    #[cfg(target_os = "macos")]
+    {
+        use block2::RcBlock;
+        use objc2::runtime::Bool;
+        use objc2_user_notifications::{UNAuthorizationOptions, UNUserNotificationCenter};
+
+        let center = UNUserNotificationCenter::currentNotificationCenter();
+        let answered: RcBlock<dyn Fn(Bool, *mut objc2_foundation::NSError)> =
+            RcBlock::new(|granted: Bool, err: *mut objc2_foundation::NSError| {
+                if !err.is_null() {
+                    tracing::warn!(
+                        error = %describe_ns_error(err),
+                        "could not ask for notification permission"
+                    );
+                } else if granted.is_false() {
+                    // Worth saying out loud: from here on the shell is silent
+                    // and nothing else would ever mention why.
+                    tracing::warn!(
+                        "notifications are not allowed; enable them for this app in \
+                         System Settings > Notifications"
+                    );
+                } else {
+                    tracing::debug!("notifications authorized");
+                }
+            });
+        center.requestAuthorizationWithOptions_completionHandler(
+            UNAuthorizationOptions::Alert | UNAuthorizationOptions::Sound,
+            &answered,
+        );
+    }
+}
+
 /// Post a desktop notification.
 ///
 /// Failures are logged, never returned: a missing notification daemon should
 /// not disturb the shell.
 pub fn notify(locale: crate::i18n::Locale, summary: &str, body: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        // macOS titles a notification with the bundle's own name, so the
+        // localized app name has nothing to do here.
+        let _ = locale;
+        if let Err(err) = notify_macos(summary, body) {
+            tracing::debug!(%err, "notification failed");
+        }
+        return;
+    }
+
+    #[cfg(not(target_os = "macos"))]
     if let Err(err) = notify_rust::Notification::new()
         .summary(summary)
         .body(body)
@@ -592,6 +667,52 @@ pub fn notify(locale: crate::i18n::Locale, summary: &str, body: &str) {
     {
         tracing::debug!(%err, "notification failed");
     }
+}
+
+/// Deliver one notification through `UNUserNotificationCenter`.
+///
+/// The identifier only has to be unique among *pending* requests. A nil trigger
+/// means "deliver now", so nothing stays pending and nothing needs looking up
+/// later; the pid is folded in so two shells never collide on an id.
+#[cfg(target_os = "macos")]
+fn notify_macos(summary: &str, body: &str) -> Result<(), String> {
+    use block2::RcBlock;
+    use objc2_foundation::NSString;
+    use objc2_user_notifications::{
+        UNMutableNotificationContent, UNNotificationRequest, UNUserNotificationCenter,
+    };
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+    let id = format!(
+        "dsh-shell-{}-{}",
+        std::process::id(),
+        NEXT_ID.fetch_add(1, Ordering::Relaxed)
+    );
+
+    let content = UNMutableNotificationContent::new();
+    content.setTitle(&NSString::from_str(summary));
+    content.setBody(&NSString::from_str(body));
+
+    let request = UNNotificationRequest::requestWithIdentifier_content_trigger(
+        &NSString::from_str(&id),
+        &content,
+        None,
+    );
+
+    // The handler is copied by the framework, which calls it once the request
+    // has been handed to the notification centre.
+    let delivered = RcBlock::new(|err: *mut objc2_foundation::NSError| {
+        if !err.is_null() {
+            tracing::warn!(
+                error = %describe_ns_error(err),
+                "the system rejected the notification"
+            );
+        }
+    });
+    UNUserNotificationCenter::currentNotificationCenter()
+        .addNotificationRequest_withCompletionHandler(&request, Some(&delivered));
+    Ok(())
 }
 
 /// Menu events surfaced to the caller.

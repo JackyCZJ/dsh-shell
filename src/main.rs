@@ -25,7 +25,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use tao::dpi::LogicalSize;
-use tao::event::{Event, WindowEvent};
+use tao::event::{Event, StartCause, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tao::platform::macos::{WindowBuilderExtMacOS, WindowExtMacOS};
 use tao::window::WindowBuilder;
@@ -390,6 +390,17 @@ fn main() {
         }
         if applied_theme {
             window.request_redraw();
+        }
+
+        // Ask for notification permission once the app is actually running.
+        //
+        // Not before the loop starts: at that point AppKit has not finished
+        // launching, and `requestAuthorization` answers `notificationsNotAllowed`
+        // rather than showing the prompt. Asked here so the prompt appears when
+        // the app opens, instead of in front of the first "the agent finished"
+        // notification — which is what the user would otherwise see instead.
+        if let Event::NewEvents(StartCause::Init) = event {
+            native::prepare_notifications();
         }
 
         // --- Second launch handed off to us -------------------------------

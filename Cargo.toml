@@ -29,7 +29,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io
 
 # Native desktop affordances
 tray-icon = "0.25"
-notify-rust = { version = "4", features = ["preview-macos-un"] }
 global-hotkey = "0.8"
 # Native app menu. Predefined items use the platform's own selectors, which is
 # what makes Cmd+C/V/X/A route to the focused webview.
@@ -37,6 +36,23 @@ muda = "0.20"
 
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Notifications.
+#
+# macOS gets its own path rather than notify-rust's: that backend still goes
+# through `NSUserNotificationCenter`, which Apple deprecated in macOS 11 and
+# which no longer delivers on macOS 26 — the call reports success, nothing
+# appears, and the app never registers as a notification source at all.
+# `UNUserNotificationCenter` is the supported API, and it is what the system's
+# Notifications pane lists.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-user-notifications = "0.3"
+block2 = "0.6"
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+notify-rust = "4"
 
 [profile.release]
 lto = "thin"
