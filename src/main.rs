@@ -25,7 +25,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use tao::dpi::LogicalSize;
-use tao::event::{Event, StartCause, WindowEvent};
+use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tao::platform::macos::{WindowBuilderExtMacOS, WindowExtMacOS};
 use tao::window::WindowBuilder;
@@ -338,6 +338,10 @@ fn main() {
     // Remembered window geometry. `last_geometry` is what has actually been
     // written; a resize or move only marks it dirty, so a drag costs one write
     // rather than one per frame.
+    // Whether the notification permission has been asked for yet. One shot:
+    // the system remembers the answer.
+    let mut asked_for_notifications = false;
+
     let mut last_geometry = restored;
     let mut geometry_dirty = false;
     let mut geometry_written_at = std::time::Instant::now();
@@ -392,14 +396,16 @@ fn main() {
             window.request_redraw();
         }
 
-        // Ask for notification permission once the app is actually running.
+        // Ask for notification permission once the loop is running.
         //
-        // Not before the loop starts: at that point AppKit has not finished
-        // launching, and `requestAuthorization` answers `notificationsNotAllowed`
-        // rather than showing the prompt. Asked here so the prompt appears when
-        // the app opens, instead of in front of the first "the agent finished"
-        // notification — which is what the user would otherwise see instead.
-        if let Event::NewEvents(StartCause::Init) = event {
+        // One shot: the system remembers the answer. Keyed on the first
+        // iteration rather than on a particular `StartCause`, so it does not
+        // depend on which event tao happens to deliver first. The loop only
+        // starts after AppKit has finished launching, which is the timing the
+        // API needs — asking before `run()` is what produced
+        // `notificationsNotAllowed`.
+        if !asked_for_notifications {
+            asked_for_notifications = true;
             native::prepare_notifications();
         }
 
