@@ -307,17 +307,54 @@ Both were learned the hard way and are worth knowing before extending this:
 ### Distributing to machines without DSH
 
 The app resolves a `dsh` launcher itself, so a machine without DSH cannot run it.
-To ship something self-contained, add the runtime under `Contents/Resources/`:
+`--bundle-runtime` ships one:
+
+```sh
+scripts/make-app.sh --bundle-runtime          # also installs to /Applications
+scripts/make-app.sh --bundle-runtime --no-install
+scripts/make-app.sh --bundle-runtime --dsh-version 0.1.5-rc.1
+```
+
+It installs `@deepseek-ai/dsh` with **bun** into `Contents/Resources/runtime/`,
+copies the bun binary beside it, and writes `Contents/Resources/bin/dsh` — the
+exact path `server.rs` already prefers. The bundle goes from 3.9 MB to **214 MB**:
 
 | Component | Size |
 |---|---|
-| Node runtime (official darwin-arm64 tarball) | ~50 MB |
-| `@deepseek-ai/dsh` packages | ~305 MB |
-| `dsh-shell` binary | ~2.7 MB |
+| bun runtime | 63 MB |
+| `node_modules` (after pruning) | ~147 MB |
+| shell binary + icon | 3.9 MB |
 
-Place `dsh` at `Contents/Resources/bin/dsh`; the resolver picks it up with no user
-configuration. The official Electron app avoids this weight by reusing Electron's
-embedded Node, which a webview-based shell does not have.
+Bun rather than Node: 63 MB against Node's 113 MB, and it is a single static
+binary with nothing to sign beyond itself. It must be launched as `bun run dsh`,
+**not** `bun <path>/lib/bin.js` — the latter cannot resolve the plugin tree. The
+shim does that, and `exec`s, so the shell still supervises the pid it started.
+
+Three things the build does that are not obvious:
+
+- **Pruning.** DSH resolves plugins through the *dependency closure* of its
+  install, so packages cannot simply be deleted. Dropping `*.d.ts`, `*.map` and
+  `*.pdb` removes 130 MB that nothing reads at runtime and cannot affect
+  resolution. TypeScript *sources* are kept: only another 7 MB, and a package
+  whose runtime entry is `.ts` would break without them.
+- **The install anchor.** DSH writes `$DSH_HOME/profiles/node_modules` as links
+  into whichever install launched it. Bundling at `Contents/Resources/runtime`
+  is what makes a fresh machine's profile point into the app instead of at a
+  global install that is not there. Verified against an empty `DSH_HOME`: the
+  profile initialises and `@deepseek-ai/dsh-base` links to
+  `…/DSH Shell.app/Contents/Resources/runtime/node_modules/…`, and the UI answers
+  `200` with `<title>DeepSeek Harness</title>`.
+- **A self-check.** The script runs the bundled launcher's `--version` before
+  signing, so it cannot produce a bundle that fails to start.
+
+Two things it does not yet handle. No lockfile is written — bun 1.4 does not emit
+one for this layout — so transitive versions are re-resolved on each build. And
+the shell's own bridge plugin still lives in the user's profile, so a fresh
+machine gets a working app without tray integration until it is installed.
+
+Node also works if you would rather not depend on bun: install
+`@deepseek-ai/dsh` into the same directory with npm or pnpm and point the shim at
+`node`. That path is untested here.
 
 ### Why the launcher needs resolving at all
 
@@ -411,9 +448,12 @@ Everything below was exercised against a real DSH install on macOS 26 (arm64):
   claimed Windows built, which was wrong. Linux shares the Unix facilities and
   should build, but has never been run: neither target is installed here, so
   neither is checked. Only macOS has actually been exercised.
-- **Shipped builds need a DSH install.** Bundling the runtime is documented above
-  but not automated.
-- **Not notarized.** Local use only until a Developer ID is applied.
+- **Shipped builds need a DSH install** unless built with `--bundle-runtime`,
+  which is automated but unverified on a machine that has never had DSH. It is
+  proven only against an empty `DSH_HOME` on a machine that already had bun.
+- **Not notarized.** Local use only until a Developer ID is applied. A bundled
+  runtime makes this harder, not easier: the bun binary and every native module
+  under `node_modules` is another Mach-O that has to be signed.
 - **No auto-update.** A new build has to be installed by hand.
 - **Language changes need a restart** for the tray and the app menu, which are
   built once at startup. The settings window picks up a change when reopened.
