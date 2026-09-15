@@ -95,3 +95,7 @@ Look for:
 `ctx.logger` is not guaranteed to implement `info`, so this plugin uses
 `console.log` for its traces — an earlier version logged through `ctx.logger` and
 the messages were silently dropped, which made a working plugin look absent.
+
+## Licence
+
+MIT — see the repository root.
