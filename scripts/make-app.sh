@@ -22,7 +22,6 @@ rm -rf "$DIST"
 mkdir -p "$DIST/Contents/MacOS" "$DIST/Contents/Resources"
 
 cp target/release/dsh-shell "$DIST/Contents/MacOS/"
-cp theme.json "$DIST/Contents/Resources/"
 cp assets/deepseek.icns "$DIST/Contents/Resources/"
 
 cat > "$DIST/Contents/Info.plist" <<'PLIST'

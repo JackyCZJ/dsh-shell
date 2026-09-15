@@ -10,6 +10,8 @@
 // directly: never publish under a name DSH owns.
 
 import assert from 'node:assert/strict'
+import os from 'node:os'
+import path from 'node:path'
 import { test } from 'node:test'
 
 import {
@@ -18,9 +20,17 @@ import {
   apply,
 } from '../lib/index.js'
 
+// Point the transport at a path with no listener. A real shell may be running on
+// the machine executing these tests, and a successful connection would hold the
+// test process open (and let a live shell answer requests the tests never sent).
+process.env.DSH_SHELL_SOCKET = path.join(
+  os.tmpdir(),
+  `dsh-shell-bridge-tests-${process.pid}.sock`,
+)
+
 /** A stand-in for the Cordis context, recording what the plugin does. */
 function fakeContext() {
-  const record = { provided: [], events: [] }
+  const record = { provided: [], events: [], injected: [] }
   return {
     record,
     ctx: {
@@ -30,6 +40,14 @@ function fakeContext() {
       },
       provide(name, service) {
         record.provided.push({ name, service })
+      },
+      // These tests are about the service name; settings is deliberately absent
+      // so they also pin that the plugin applies without it.
+      get() {
+        return undefined
+      },
+      inject(deps) {
+        record.injected.push(deps)
       },
     },
   }

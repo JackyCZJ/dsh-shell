@@ -225,6 +225,15 @@ pub async fn start(dsh_program: String, port: u16) -> Result<DshServer, String> 
 
         if let Some(url) = extract_url(&line) {
             tracing::info!(%url, "dsh web ready");
+            // Keep draining stdout for the life of the host. Abandoning the
+            // reader would let the pipe buffer fill, and the host would block
+            // forever on its next write — which is what a plugin logging to
+            // stdout does. The lines are only useful as diagnostics.
+            tokio::spawn(async move {
+                while let Ok(Some(line)) = lines.next_line().await {
+                    tracing::debug!(target: "dsh", "{line}");
+                }
+            });
             return Ok(DshServer { child, url });
         }
     }
@@ -306,6 +315,20 @@ mod tests {
             Some(v) => unsafe { std::env::set_var("DSH_BIN", v) },
             None => unsafe { std::env::remove_var("DSH_BIN") },
         }
+    }
+
+    /// Reading the URL must not end stdout consumption.
+    ///
+    /// The reader is moved into a task rather than dropped, because a host that
+    /// keeps writing (a plugin logging, for instance) would otherwise block once
+    /// the pipe buffer filled. This test pins the *intent*; the compile-time
+    /// guarantee is that `lines` is moved rather than dropped.
+    #[test]
+    fn the_url_line_is_recognised_before_any_other_output() {
+        // Whatever else the host prints, the URL is what starts the shell.
+        assert!(extract_url("dsh web: http://127.0.0.1:1/?token=a").is_some());
+        // Plugin chatter must not be mistaken for it.
+        assert!(extract_url("[dsh-plugin-shell-bridge] connected to shell").is_none());
     }
 
     #[test]

@@ -41,7 +41,8 @@ runtime it was trying to avoid in the first place.
 | **Close to tray** | Closing hides; the host and session keep running |
 | **Boot screen** | DSH's own loading state — whale, wordmark, spinner |
 | **Light / dark** | Follows DSH's `ui-theme.preference`, then the OS |
-| **Live theme reload** | Edit `theme.json` and the chrome *and* the page update, no restart |
+| **Live settings** | Changes to the namespace update the chrome *and* the page, no restart |
+| **Settings window** | Tray → Settings…; writes go through DSH, which persists them |
 | **Plugin bridge** | A real DSH Host plugin forwards `agent/*` events to the shell |
 
 ## Requirements
@@ -77,47 +78,83 @@ Distribution to other machines needs a Developer ID and notarization — see
 |---|---|---|
 | `DSH_BIN` | auto-detected | Path to the `dsh` launcher |
 | `DSH_PORT` | `0` | Port for `dsh web`; `0` lets the OS choose |
-| `DSH_THEME` | `./theme.json` | Theme file to load and watch |
+| `DSH_SETTINGS` | `$DSH_HOME/settings.yaml` | Settings document to read |
+| `DSH_HOME` | `~/.dsh` | DSH home; locates `settings.yaml` |
 | `RUST_LOG` | `info` | Log filter |
 
-## Theming, live
+## Configuration lives in DSH
 
-`theme.json` carries a light and a dark palette. Both are taken from **DSH's own
-boot theme CSS**, so the window chrome and the page share one colour and the seam
-between them disappears.
+The shell has **no config file of its own**. Its settings live in DSH's
+`settings.yaml` under the `dsh-shell` namespace, registered by the Host plugin:
 
-```json
-{
-  "appearance": "system",
-  "light": { "background": "#ffffff", "text": "#0f1115" },
-  "dark":  { "background": "#151517", "text": "#f9fafb" }
-}
+```yaml
+dsh-shell:
+  hotkey: meta+shift+D
+  captionHeight: 34
+  trafficLightInsetX: 20
+  trafficLightInsetY: 20
+  light:
+    background: "#ffffff"
+    surface: "#f5f6f7"
+    surfaceHover: "#e9ebed"
+    border: "#d9dcdf"
+    text: "#0f1115"
+    textMuted: "#81858c"
+    accent: "#4176e6"
+  dark:
+    background: "#151517"
+    surface: "#2c2c2e"
+    surfaceHover: "#3a3a3c"
+    border: "#3f3f42"
+    text: "#f9fafb"
+    textMuted: "#adb2b8"
+    accent: "#4176e6"
+  customCss: ""
 ```
 
-Appearance resolves in this order:
+This is the same arrangement the official DSH desktop app uses for its own
+`dsh-desktop` namespace, and it means **DSH owns validation and persistence**.
+The shell only reads.
 
-1. **`appearance` in `theme.json`** — `light`, `dark`, or `system`.
-2. **DSH's own `ui-theme.preference`** from `$DSH_HOME/settings.yaml`.
-3. **The operating system**, when DSH is set to `system`.
+Two ways to change it, both landing in the same document:
 
-Step 2 matters: DSH applies its preference to the page, so a shell that followed
-the OS instead would render a dark caption bar over a light page whenever the two
-disagreed. Resolution happens in one function, so the native window colour and the
-injected CSS cannot drift apart.
+| | |
+|---|---|
+| **The shell's settings window** | Tray → **Settings…**. Writes go through the Host plugin, so DSH persists them and the rest of `settings.yaml` is preserved by DSH's own writer. |
+| **Editing the document** | Any editor. The shell watches the file and applies changes live. |
 
-Because the file is watched, edits apply to **both the native chrome and the page**
-with no restart and no loss of session:
+You can also call the namespace directly from any DSH-side surface:
 
-```sh
-jq '.appearance="dark"' theme.json > t && mv t theme.json
+```js
+ctx.settings.update('dsh-shell', { hotkey: 'meta+alt+K' })
 ```
 
-Change `custom_css` for one-off tweaks — it is appended last, so it overrides the
-generated rules:
+### Applied live
 
-```json
-"custom_css": "body { --dsh-content-font-size: 15px; }"
-```
+Both palettes, the caption height, the traffic-light inset, the hotkey, and
+`customCss` apply **without a restart and without losing the session**. The file
+watcher covers hand edits; a change written through the namespace is pushed to
+the shell so it lands immediately rather than waiting out the debounce.
+
+A rejected value never leaves you without a working setting: an unavailable
+hotkey keeps the previous shortcut, and a malformed document keeps the last good
+theme rather than blanking the window.
+
+### How light and dark are decided
+
+There is **no shell-side appearance setting**, deliberately. The page follows
+DSH's own `ui-theme.preference`, so the chrome resolves from the same value:
+
+1. **DSH's `ui-theme.preference`** from `settings.yaml`.
+2. **The operating system**, when DSH says `system` or says nothing.
+
+A shell override could only ever make the two disagree — a dark caption bar over
+a light page — which is the exact seam this theming exists to remove. To change
+the theme, change it in DSH's Settings. The official desktop app takes the same
+position: it mirrors DSH's preference and offers no override of its own.
+
+Both palettes are taken from **DSH's own boot-theme CSS** (`#151517` dark,
+`#ffffff` light), so the window chrome and the page share one colour.
 
 ## Keyboard
 
@@ -180,12 +217,13 @@ src/
   native.rs  tray, notifications, global hotkey, appearance detection
   server.rs  spawns `dsh web`, parses its URL, kills it on exit
   bridge.rs  the shell's side of the plugin bridge
-  theme.rs   tokens, JSON load, watcher
+  settings.rs the settings window
+  theme.rs   tokens, settings.yaml reading, watcher
 assets/
   boot.html       the loading screen
   deepseek.svg    DSH's official icon
   deepseek.icns   built from the SVG for the bundle
-theme.json        the hot-reloadable document
+# configuration lives in DSH's settings.yaml
 ```
 
 ### Two threading rules
@@ -200,6 +238,11 @@ Both were learned the hard way and are worth knowing before extending this:
 2. **`wry::WebView` is `!Send`.** It wraps main-thread-only AppKit objects, so a
    background thread must never touch it. The theme watcher publishes over a
    channel and the event loop applies the change; the compiler enforces this.
+
+3. **Keep draining the host's stdout.** The launcher stops reading once it has
+   the URL, so the reader is moved into a task rather than dropped. A host that
+   keeps writing — a plugin logging, for instance — would otherwise block forever
+   once the pipe buffer filled.
 
 ## Packaging
 
@@ -263,7 +306,7 @@ xcrun stapler staple "DSH Shell.app"
 - Notarization requires a paid Developer ID and the hardened runtime.
 - Add the `com.apple.security.network.client` entitlement — the webview connects
   to the loopback host.
-- Re-sign after changing anything inside the bundle (including `theme.json`), or
+- Re-sign after changing anything inside the bundle, or
   the signature is invalidated.
 
 ## Development

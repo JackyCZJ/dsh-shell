@@ -21,6 +21,9 @@ notify = "8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# Reading DSH's own settings.yaml (the shell's config lives there)
+serde_norway = "0.9"
+
 # Launching and supervising `dsh web`
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "time", "sync"] }
 

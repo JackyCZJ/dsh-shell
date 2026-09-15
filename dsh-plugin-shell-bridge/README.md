@@ -97,6 +97,87 @@ Notes on the contract:
   real `agent/*` events, so a plugin cannot make the tray misrepresent the agent.
 - Labels are flattened to one line and capped at 60 characters.
 
+## Settings (DSH-owned)
+
+The shell keeps **no configuration file of its own**. Its settings live in DSH's
+document (`$DSH_HOME/settings.yaml`) under the **`dsh-shell`** namespace,
+registered by this plugin — the same arrangement the official desktop app uses
+for its `dsh-desktop` namespace. DSH validates and persists the section; the
+shell only reads it (directly for startup, and from a pushed event once the host
+is up).
+
+### The section
+
+```yaml
+dsh-shell:
+  hotkey: meta+shift+D
+  captionHeight: 34
+  trafficLightInsetX: 20
+  trafficLightInsetY: 20
+  light:
+    background: "#ffffff"
+    surface: "#f5f6f7"
+    surfaceHover: "#e9ebed"
+    border: "#d9dcdf"
+    text: "#0f1115"
+    textMuted: "#81858c"
+    accent: "#4176e6"
+  dark:
+    background: "#151517"
+    surface: "#2c2c2e"
+    surfaceHover: "#3a3a3c"
+    border: "#3f3f42"
+    text: "#f9fafb"
+    textMuted: "#adb2b8"
+    accent: "#4176e6"
+  customCss: ""
+```
+
+Every field carries a schema default, so a fresh install and a hand-written
+partial section both resolve to a usable window. The resolved value is the
+schema defaults, then this plugin's composition base, then the user's section —
+DSH's normal layering.
+
+### Writes reach DSH, not the file
+
+The shell asks the plugin to persist a change over the same socket:
+
+```json
+{"id":"shell-1","method":"setConfig","config":{"hotkey":"meta+alt+K"}}
+```
+
+The plugin merges it into the user layer with
+`ctx.settings.update('dsh-shell', config)`, so DSH performs validation and its
+writer preserves every other namespace in the document. The reply is
+`{"id":"shell-1","ok":true}` on success, or
+`{"id":"shell-1","ok":false,"error":"…"}` for a rejected write — a validation
+failure is a value, never an exception.
+
+### Live updates
+
+On every committed change — a UI write or a hand edit picked up by the provider
+— the plugin pushes the **full resolved section**:
+
+```json
+{"kind":"settings","config":{ … }}
+```
+
+The shell applies it live, so it never has to re-read the file to see a change.
+
+### When the settings service is absent
+
+Registration uses `ctx.settings.installSection`, the optional-service wiring: it
+registers the namespace while a provider is mounted and hands back the
+composition defaults when none is. With no settings service the plugin still
+boots, the shell still gets its defaults, and a `setConfig` write is answered
+with `ok:false` instead of throwing.
+
+Resolution itself is best-effort too. This plugin has no npm dependency on
+schemastery: the host's own copy is located through `ctx.baseUrl` (the profile
+directory, whose parent walk reaches the installation's shared fallback). If it
+cannot be resolved, or a stored section fails validation, the failure is logged
+and the host boots unchanged.
+
 ## Transport
 
 A Unix domain socket at `$XDG_RUNTIME_DIR/dsh-shell-<uid>.sock`, or `$TMPDIR` when
@@ -126,6 +207,12 @@ protocol traffic in some profiles, and interleaving would corrupt it.
   (**7 socket FDs held by the host process**).
 - Events sent over the socket are received and processed by the shell.
 - The host boots identically when the shell is not running.
+- The `dsh-shell` namespace registers in the real host
+  (`settings namespace "dsh-shell" registered`, no load error) and the composed
+  profile boots to its `dsh web: http://…` URL.
+- `npm test` covers the documented defaults (resolved through a real
+  schemastery), routing of `setConfig` to `settings.update`, and the full
+  request/reply round trip over a real Unix socket.
 
 ## Debugging
 
@@ -142,6 +229,7 @@ Look for:
 ```
 [dsh-plugin-shell-bridge] apply() called; socket=...
 [dsh-plugin-shell-bridge] connected to shell
+[dsh-plugin-shell-bridge] settings namespace "dsh-shell" registered
 ```
 
 `ctx.logger` is not guaranteed to implement `info`, so this plugin uses

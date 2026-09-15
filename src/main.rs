@@ -14,6 +14,7 @@ mod bridge;
 mod menu;
 mod native;
 mod server;
+mod settings;
 mod theme;
 
 use std::path::PathBuf;
@@ -64,11 +65,14 @@ fn main() {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(0);
-    let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let theme_path = theme_path(&workspace);
-
-    tracing::info!(theme = %theme_path.display(), "loading theme");
-    let theme_source = ThemeSource::new(theme_path);
+    // Config lives in DSH's own settings document, under the `dsh-shell`
+    // namespace the Host plugin registers. There is no shell-owned config file.
+    let settings_file = theme::settings_path().unwrap_or_else(|| {
+        tracing::warn!("no DSH home found; using built-in defaults");
+        PathBuf::from("settings.yaml")
+    });
+    tracing::info!(settings = %settings_file.display(), "reading configuration");
+    let theme_source = ThemeSource::new(settings_file);
 
     // Start `dsh web` on a worker runtime so the UI thread is never blocked
     // waiting for the host to boot.
@@ -106,7 +110,12 @@ fn main() {
     // the same reason events are: they touch main-thread-only objects.
     let (request_tx, request_rx) = std::sync::mpsc::channel::<bridge::ShellRequest>();
     let request_tx_for_handler = request_tx.clone();
+    // The shell pushes settings writes through this link, so DSH owns
+    // persistence and its writer preserves the rest of settings.yaml.
+    let plugin_link = bridge::PluginLink::default();
+    let link_for_listener = plugin_link.clone();
     if let Err(err) = bridge::listen(
+        link_for_listener,
         move |event| {
             let _ = bridge_tx.send(event);
         },
@@ -169,8 +178,8 @@ fn main() {
             .with_title_hidden(true)
             .with_fullsize_content_view(true)
             .with_traffic_light_inset(tao::dpi::LogicalPosition::new(
-                theme_for_window.traffic_light_inset.x,
-                theme_for_window.traffic_light_inset.y,
+                theme_for_window.traffic_light_inset_x,
+                theme_for_window.traffic_light_inset_y,
             ));
     }
 
@@ -190,9 +199,12 @@ fn main() {
     // its theme background immediately; it navigates once the host is ready.
     let webview = wry::WebViewBuilder::new()
         .with_background_color(hex_to_rgba(
-            theme_for_window.palette_for(resolved_dark(&theme_for_window)).background.0,
+            theme_for_window.palette_for(resolved_dark(&theme_source)).background.0,
         ))
-        .with_initialization_script(&inject_script(&theme_for_window))
+        .with_initialization_script(&inject_script(
+            &theme_for_window,
+            resolved_dark(&theme_source),
+        ))
         .with_ipc_handler(move |request| {
             let Some(window) = window_weak.upgrade() else {
                 return;
@@ -225,7 +237,7 @@ fn main() {
     if let Ok(wv) = webview.lock() {
         let script = format!(
             "window.__dshBoot && window.__dshBoot.setAppearance({});",
-            resolved_dark(&theme_for_window)
+            resolved_dark(&theme_source)
         );
         let _ = wv.evaluate_script(&script);
     }
@@ -245,7 +257,16 @@ fn main() {
     let mut navigated = false;
     let mut server: Option<server::DshServer> = None;
 
-    event_loop.run(move |event, _, control_flow| {
+    let main_window_id = window.id();
+    // The settings window is created on demand and dropped when closed.
+    let mut settings_window: Option<SettingsWindow> = None;
+    // A save request handed from the settings page to the UI thread.
+    let (settings_tx, settings_rx) =
+        std::sync::mpsc::channel::<(String, settings::SettingsRequest)>();
+    // Save outcomes come back from the worker thread that talked to the Host.
+    let (save_tx, save_rx) = std::sync::mpsc::channel::<(bool, Option<String>)>();
+
+    event_loop.run(move |event, event_loop, control_flow| {
         // The Rc owns the window; `&*window` yields the `&Window` the APIs want.
         let window = &*window;
 
@@ -263,43 +284,22 @@ fn main() {
         let mut applied_theme = false;
         while let Ok(theme) = theme_rx.try_recv() {
             if let Ok(wv) = webview.lock() {
-                if let Err(err) = wv.evaluate_script(&rewrite_style_script(&theme)) {
+                if let Err(err) = wv.evaluate_script(&rewrite_style_script(&theme, resolved_dark(&theme_source))) {
                     tracing::warn!(%err, "could not apply theme to page");
                 }
             }
 
-            // Hotkey changes ride the same reload. A rejected shortcut leaves
-            // the previous one registered, so the user is never left without a
-            // way to summon the window.
-            if let Some(active) = hotkey.as_mut() {
-                match native::HotkeySpec::parse(&theme.hotkey) {
-                    Ok(spec) => match active.retarget(spec) {
-                        Ok(()) => tracing::info!(
-                            shortcut = %active.spec().to_string_canonical(),
-                            "hotkey updated"
-                        ),
-                        Err(err) => tracing::warn!(
-                            %err,
-                            keeping = %active.spec().to_string_canonical(),
-                            "hotkey change rejected; previous shortcut kept"
-                        ),
-                    },
-                    Err(err) => tracing::warn!(
-                        shortcut = %theme.hotkey,
-                        %err,
-                        "invalid hotkey; previous shortcut kept"
-                    ),
-                }
-            }
+            // Hotkey changes ride the same reload.
+            update_hotkey(&mut hotkey, &theme);
             // `tao::window::RGBA` is a plain (r, g, b, a) tuple, which is what
             // `hex_to_rgba` already produces.
             window.set_background_color(Some(hex_to_rgba(
-                theme.palette_for(resolved_dark(&theme)).background.0,
+                theme.palette_for(resolved_dark(&theme_source)).background.0,
             )));
             #[cfg(target_os = "macos")]
             window.set_traffic_light_inset(tao::dpi::LogicalPosition::new(
-                theme.traffic_light_inset.x,
-                theme.traffic_light_inset.y,
+                theme.traffic_light_inset_x,
+                theme.traffic_light_inset_y,
             ));
             applied_theme = true;
         }
@@ -317,6 +317,15 @@ fn main() {
                     Some(native::TrayCommand::Show) => {
                         window.set_visible(true);
                         window.set_focus();
+                    }
+                    Some(native::TrayCommand::Settings) => {
+                        open_settings(
+                            &mut settings_window,
+                            event_loop,
+                            &theme_source,
+                            &plugin_link,
+                            &settings_tx,
+                        );
                     }
                     Some(native::TrayCommand::Quit) => {
                         shutdown_server(&mut server);
@@ -379,6 +388,75 @@ fn main() {
             }
         }
 
+        // --- Settings saves ------------------------------------------------
+        //
+        // Handled on the UI thread: a successful save reloads the theme, which
+        // repaints the native window.
+        while let Ok((_body, request)) = settings_rx.try_recv() {
+            match request {
+                settings::SettingsRequest::Save { config } => {
+                    // Validate here so an obviously wrong entry is reported
+                    // immediately; DSH validates again when it persists.
+                    match settings::validate(&config) {
+                        Err(err) => {
+                            if let Some(active) = settings_window.as_ref() {
+                                let outcome = settings::SaveOutcome {
+                                    ok: false,
+                                    error: Some(err),
+                                };
+                                let _ = active.webview.evaluate_script(&outcome.to_script());
+                            }
+                        }
+                        Ok(theme) => {
+                            // The write blocks on the Host's reply, so it runs on
+                            // a worker and reports back through a channel.
+                            let link = plugin_link.clone();
+                            let tx = save_tx.clone();
+                            std::thread::spawn(move || {
+                                let payload = serde_json::json!({ "config": theme });
+                                let outcome = link
+                                    .call(
+                                        "setConfig",
+                                        payload,
+                                        std::time::Duration::from_secs(10),
+                                    )
+                                    .map(|(ok, error)| (ok, error))
+                                    .unwrap_or_else(|err| (false, Some(err)));
+                                let _ = tx.send(outcome);
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- Settings save outcomes ----------------------------------------
+        //
+        // Reported on the UI thread, then the page is told and the theme is
+        // re-read so the form shows what DSH actually persisted.
+        while let Ok((ok, error)) = save_rx.try_recv() {
+            let outcome = settings::SaveOutcome { ok, error };
+            if let Some(active) = settings_window.as_ref() {
+                let _ = active.webview.evaluate_script(&outcome.to_script());
+            }
+            if ok {
+                // DSH writes the document, so pick the canonical value up from it.
+                if let Some(theme) = theme_source.reload() {
+                    if let Ok(wv) = webview.lock() {
+                        let _ = wv.evaluate_script(&rewrite_style_script(&theme, resolved_dark(&theme_source)));
+                    }
+                    if let Some(active) = settings_window.as_ref() {
+                        let script = format!(
+                            "window.__dshSettings && window.__dshSettings.update({});",
+                            serde_json::to_string(&*theme).unwrap_or_else(|_| "{}".into())
+                        );
+                        let _ = active.webview.evaluate_script(&script);
+                    }
+                    apply_theme_to_chrome(&window, &theme, resolved_dark(&theme_source));
+                }
+            }
+        }
+
         // --- Shell requests from plugins ----------------------------------
         //
         // A plugin asking the shell to do something. Each maps onto a native
@@ -424,6 +502,30 @@ fn main() {
         // limited to events a user actually wants interrupting; see
         // `BridgeEvent::wants_notification`.
         while let Ok(event) = bridge_rx.try_recv() {
+            // A settings push means DSH persisted a change. Apply it, then tell
+            // the settings page so an open form reflects what was stored.
+            if let Some(theme) = event.as_theme() {
+                match theme_source.apply_pushed(theme) {
+                    Some(theme) => {
+                        tracing::info!("settings pushed by the host");
+                        if let Ok(wv) = webview.lock() {
+                            let _ = wv.evaluate_script(&rewrite_style_script(&theme, resolved_dark(&theme_source)));
+                        }
+                        if let Some(active) = settings_window.as_ref() {
+                            let script = format!(
+                                "window.__dshSettings && window.__dshSettings.update({});",
+                                serde_json::to_string(&*theme).unwrap_or_else(|_| "{}".into())
+                            );
+                            let _ = active.webview.evaluate_script(&script);
+                        }
+                        apply_theme_to_chrome(&window, &theme, resolved_dark(&theme_source));
+                        update_hotkey(&mut hotkey, &theme);
+                    }
+                    None => tracing::debug!("pushed settings matched the current theme"),
+                }
+                continue;
+            }
+
             tracing::info!(kind = %event.kind, summary = %event.summary(), "bridge event");
             if let Some(state) = native::AgentState::from_event(&event.kind, event.status.as_deref())
             {
@@ -499,6 +601,15 @@ fn main() {
         }
 
         match event {
+            // The settings window closes independently of the main one.
+            Event::WindowEvent {
+                window_id,
+                event: WindowEvent::CloseRequested,
+                ..
+            } if window_id != main_window_id => {
+                tracing::debug!("settings window closed");
+                settings_window = None;
+            }
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
                 ..
@@ -527,8 +638,8 @@ fn main() {
             } => {
                 let t = theme_source.current();
                 window.set_traffic_light_inset(tao::dpi::LogicalPosition::new(
-                    t.traffic_light_inset.x,
-                    t.traffic_light_inset.y,
+                    t.traffic_light_inset_x,
+                    t.traffic_light_inset_y,
                 ));
             }
             _ => {}
@@ -561,31 +672,128 @@ fn initial_hotkey_spec(theme_source: &ThemeSource) -> native::HotkeySpec {
             tracing::warn!(
                 shortcut = %text,
                 %err,
-                "invalid hotkey in theme.json; using the default"
+                "invalid hotkey in settings; using the default"
             );
             native::HotkeySpec::default_spec()
         }
     }
 }
 
+/// The settings window and its page.
+///
+/// Held together so closing the window drops the web view too. `Window` is not
+/// `Clone`, so the pair lives in one place.
+struct SettingsWindow {
+    window: tao::window::Window,
+    webview: wry::WebView,
+}
+
+/// Open the settings window, or bring an existing one forward.
+fn open_settings(
+    slot: &mut Option<SettingsWindow>,
+    event_loop: &tao::event_loop::EventLoopWindowTarget<()>,
+    theme_source: &ThemeSource,
+    link: &bridge::PluginLink,
+    tx: &std::sync::mpsc::Sender<(String, settings::SettingsRequest)>,
+) {
+    if let Some(existing) = slot.as_ref() {
+        existing.window.set_visible(true);
+        existing.window.set_focus();
+        return;
+    }
+
+    let theme = theme_source.current();
+    let builder = tao::window::WindowBuilder::new()
+        .with_title("DSH Shell Settings")
+        .with_inner_size(tao::dpi::LogicalSize::new(620.0, 720.0))
+        .with_min_inner_size(tao::dpi::LogicalSize::new(480.0, 420.0));
+
+    let window = match builder.build(event_loop) {
+        Ok(window) => window,
+        Err(err) => {
+            tracing::warn!(%err, "could not open the settings window");
+            return;
+        }
+    };
+
+    let tx = tx.clone();
+    let webview = wry::WebViewBuilder::new()
+        .with_html(settings::page(&theme, link.is_connected()))
+        .with_ipc_handler(move |request| {
+            let body = request.body().to_string();
+            match settings::parse_request(&body) {
+                Ok(parsed) => {
+                    // Hand it to the UI thread: a save eventually reloads the
+                    // theme, which touches main-thread-only objects.
+                    if tx.send((body, parsed)).is_err() {
+                        tracing::debug!("settings request dropped; shell is shutting down");
+                    }
+                }
+                Err(err) => tracing::warn!(%err, "unusable settings message"),
+            }
+        })
+        .build(&window);
+
+    match webview {
+        Ok(webview) => {
+            *slot = Some(SettingsWindow { window, webview });
+            if let Some(active) = slot.as_ref() {
+                active.window.set_focus();
+            }
+        }
+        Err(err) => tracing::warn!(%err, "could not create the settings page"),
+    }
+}
+
+/// Apply a hotkey change from a theme.
+///
+/// A rejected shortcut leaves the previous one registered, so the user is never
+/// left without a way to summon the window.
+fn update_hotkey(hotkey: &mut Option<native::HotKeyHandle>, theme: &Theme) {
+    let Some(active) = hotkey.as_mut() else {
+        return;
+    };
+    match native::HotkeySpec::parse(&theme.hotkey) {
+        Ok(spec) => match active.retarget(spec) {
+            Ok(()) => tracing::info!(
+                shortcut = %active.spec().to_string_canonical(),
+                "hotkey updated"
+            ),
+            Err(err) => tracing::warn!(
+                %err,
+                keeping = %active.spec().to_string_canonical(),
+                "hotkey change rejected; previous shortcut kept"
+            ),
+        },
+        Err(err) => tracing::warn!(
+            shortcut = %theme.hotkey,
+            %err,
+            "invalid hotkey; previous shortcut kept"
+        ),
+    }
+}
+
+/// Apply a theme to the native chrome: window background and traffic lights.
+fn apply_theme_to_chrome(window: &tao::window::Window, theme: &Theme, is_dark: bool) {
+    window.set_background_color(Some(hex_to_rgba(
+        theme.palette_for(is_dark).background.0,
+    )));
+    #[cfg(target_os = "macos")]
+    window.set_traffic_light_inset(tao::dpi::LogicalPosition::new(
+        theme.traffic_light_inset_x,
+        theme.traffic_light_inset_y,
+    ));
+    window.request_redraw();
+}
+
 /// Decide whether the shell should render dark.
 ///
-/// Precedence, and why:
-///   1. The theme file's own `appearance`, so a user can pin the shell.
-///   2. DSH's `ui-theme.preference`, because that is what DSH applies to the
-///      page — following the OS instead would let the chrome and the page
-///      disagree, which is the exact seam this theming exists to remove.
-///   3. The operating system, for DSH's `system` setting.
-///
-/// Resolved in one place so the native window and the injected CSS cannot
-/// drift apart.
-fn resolved_dark(theme: &Theme) -> bool {
-    use theme::Appearance;
-    match theme.appearance {
-        Appearance::Light => false,
-        Appearance::Dark => true,
-        Appearance::System => native::resolved_is_dark(),
-    }
+/// There is deliberately no shell-side override: the page follows DSH's own
+/// `ui-theme.preference`, so the chrome must resolve appearance from it too.
+/// A shell override could only ever make the two disagree. To change the theme,
+/// change it in DSH — that is the DSH-native path.
+fn resolved_dark(theme_source: &ThemeSource) -> bool {
+    theme_source.is_dark()
 }
 
 /// Stop the supervised host, if one is running.
@@ -600,18 +808,7 @@ fn shutdown_server(server: &mut Option<server::DshServer>) {
     }
 }
 
-/// Resolve `theme.json`, preferring the crate directory so `cargo run` works
-/// from anywhere, with `DSH_THEME` as an explicit override.
-fn theme_path(workspace: &std::path::Path) -> PathBuf {
-    if let Ok(explicit) = std::env::var("DSH_THEME") {
-        return PathBuf::from(explicit);
-    }
-    let manifest_relative = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("theme.json");
-    if manifest_relative.exists() {
-        return manifest_relative;
-    }
-    workspace.join("theme.json")
-}
+
 
 /// `0xrrggbb` to the RGBA byte order `wry` expects.
 fn hex_to_rgba(hex: u32) -> (u8, u8, u8, u8) {
@@ -627,7 +824,7 @@ fn hex_to_rgba(hex: u32) -> (u8, u8, u8, u8) {
 ///
 /// Both are installed here rather than through separate initialization scripts
 /// so they share one `DOMContentLoaded` path and survive navigations together.
-fn inject_script(theme: &Theme) -> String {
+fn inject_script(theme: &Theme, is_dark: bool) -> String {
     format!(
         r#"(function() {{
   var apply = function() {{
@@ -692,7 +889,7 @@ fn inject_script(theme: &Theme) -> String {
     }}
   }}
 }})();"#,
-        payload = json_string(&theme.injected_css(resolved_dark(&theme))),
+        payload = json_string(&theme.injected_css(is_dark)),
         drag_message = json_string(DRAG_MESSAGE),
         zoom_message = json_string(ZOOM_MESSAGE),
         ready_message = json_string(READY_MESSAGE),
@@ -700,7 +897,7 @@ fn inject_script(theme: &Theme) -> String {
 }
 
 /// Script that replaces the style element's contents on a theme reload.
-fn rewrite_style_script(theme: &Theme) -> String {
+fn rewrite_style_script(theme: &Theme, is_dark: bool) -> String {
     format!(
         r#"(function() {{
   var el = document.getElementById('__dsh_shell_theme');
@@ -711,7 +908,7 @@ fn rewrite_style_script(theme: &Theme) -> String {
   }}
   el.textContent = {payload};
 }})();"#,
-        payload = json_string(&theme.injected_css(resolved_dark(&theme)))
+        payload = json_string(&theme.injected_css(is_dark))
     )
 }
 
@@ -731,7 +928,7 @@ mod tests {
         // A quote and a newline are the cases that would break naive string
         // interpolation into the script.
         t.custom_css = "body { content: \"a\\\"b\"; }\n/* x */".into();
-        let script = inject_script(&t);
+        let script = inject_script(&t, false);
 
         // The payload must be JSON-escaped, not raw.
         assert!(script.contains("\\\"a\\\\\\\"b\\\""), "expected escaping: {script}");
@@ -746,7 +943,7 @@ mod tests {
 
     #[test]
     fn injected_script_installs_the_drag_region() {
-        let script = inject_script(&Theme::default());
+        let script = inject_script(&Theme::default(), false);
         // The strip must be created and wired to IPC, or the window cannot be
         // moved at all once the system titlebar is hidden.
         assert!(script.contains("__dsh_shell_drag"), "drag element missing");
@@ -772,12 +969,11 @@ mod tests {
 
     #[test]
     fn theme_tokens_reach_the_script() {
-        // Pin the appearance so the assertion does not depend on the machine's
-        // current light/dark setting.
+        // Resolve light explicitly so the assertion does not depend on the
+        // machine's current appearance.
         let mut t = Theme::default();
-        t.appearance = theme::Appearance::Light;
         t.light.accent = ColorHex(0x123456);
-        let script = inject_script(&t);
+        let script = inject_script(&t, false);
         assert!(script.contains("#123456"), "accent missing from script");
     }
 }

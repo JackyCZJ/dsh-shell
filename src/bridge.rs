@@ -8,8 +8,10 @@
 //! DSH is not running, or the plugin is not installed, nothing happens and the
 //! shell works exactly as before.
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
@@ -87,6 +89,12 @@ impl ShellReply {
 pub enum Incoming {
     Event(BridgeEvent),
     Request { id: String, request: ShellRequest },
+    /// The plugin's answer to a request the shell made.
+    Reply {
+        id: String,
+        ok: bool,
+        error: Option<String>,
+    },
     /// A line that looked like a request but could not be parsed.
     ///
     /// Carries the id when one was present so the caller can be told its request
@@ -108,9 +116,27 @@ pub fn parse_incoming(line: &str) -> Option<Incoming> {
         id: Option<String>,
         #[serde(default)]
         method: Option<String>,
+        #[serde(default)]
+        ok: Option<bool>,
     }
 
     if let Ok(envelope) = serde_json::from_str::<Envelope>(trimmed) {
+        // A reply carries `ok` and an id but no method: it answers a request the
+        // shell made rather than starting one.
+        if envelope.method.is_none() {
+            if let (Some(id), Some(ok)) = (envelope.id.clone(), envelope.ok) {
+                #[derive(Deserialize)]
+                struct ReplyBody {
+                    #[serde(default)]
+                    error: Option<String>,
+                }
+                let error = serde_json::from_str::<ReplyBody>(trimmed)
+                    .ok()
+                    .and_then(|b| b.error);
+                return Some(Incoming::Reply { id, ok, error });
+            }
+        }
+
         if let Some(method) = envelope.method {
             return match serde_json::from_str::<ShellRequest>(trimmed) {
                 Ok(request) => Some(Incoming::Request {
@@ -147,6 +173,11 @@ pub struct BridgeEvent {
     pub message: Option<String>,
     #[serde(default)]
     pub reason: Option<String>,
+    /// Present on a `settings` event: the resolved `dsh-shell` section DSH just
+    /// persisted. Carried as raw JSON so this crate does not have to know the
+    /// settings shape; the theme module parses it.
+    #[serde(default)]
+    pub config: Option<serde_json::Value>,
 }
 
 /// Follow the host's snake_case field names.
@@ -161,6 +192,15 @@ impl BridgeEvent {
             "disposed" => "agent disposed".to_string(),
             other => other.to_string(),
         }
+    }
+
+    /// Present the pushed settings as a theme, if this is a settings event.
+    pub fn as_theme(&self) -> Option<crate::theme::Theme> {
+        if self.kind != "settings" {
+            return None;
+        }
+        let config = self.config.as_ref()?;
+        serde_json::from_value(config.clone()).ok()
     }
 
     /// Whether this event warrants a desktop notification.
@@ -211,6 +251,102 @@ pub fn parse_event(line: &str) -> Option<BridgeEvent> {
     serde_json::from_str(trimmed).ok()
 }
 
+/// A handle for sending requests to the connected Host plugin.
+///
+/// The plugin dials the shell, so the shell writes back on the same connection.
+/// One connection is expected at a time; a reconnect replaces it.
+#[derive(Clone, Default)]
+pub struct PluginLink {
+    inner: Arc<Mutex<PluginLinkInner>>,
+}
+
+#[derive(Default)]
+struct PluginLinkInner {
+    stream: Option<std::os::unix::net::UnixStream>,
+    /// Requests awaiting a reply, keyed by id.
+    pending: HashMap<String, std::sync::mpsc::Sender<(bool, Option<String>)>>,
+    next_id: u64,
+}
+
+impl PluginLink {
+    /// Whether a plugin is currently connected.
+    pub fn is_connected(&self) -> bool {
+        self.inner.lock().unwrap().stream.is_some()
+    }
+
+    /// Send a request and block until the plugin answers, or the timeout expires.
+    ///
+    /// Blocking is acceptable only because callers run this off the UI thread;
+    /// the settings window does so on a worker.
+    pub fn call(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        timeout: std::time::Duration,
+    ) -> Result<(bool, Option<String>), String> {
+        let (id, rx) = {
+            let mut inner = self.inner.lock().unwrap();
+
+            inner.next_id += 1;
+            let id = format!("shell-{}", inner.next_id);
+
+            if inner.stream.is_none() {
+                return Err("the DSH host is not connected".into());
+            }
+
+            let (tx, rx) = std::sync::mpsc::channel();
+            inner.pending.insert(id.clone(), tx);
+
+            let stream = inner
+                .stream
+                .as_mut()
+                .ok_or_else(|| "the DSH host is not connected".to_string())?;
+
+            let mut message = serde_json::Map::new();
+            message.insert("id".into(), serde_json::Value::String(id.clone()));
+            message.insert("method".into(), serde_json::Value::String(method.into()));
+            if let serde_json::Value::Object(fields) = params {
+                for (k, v) in fields {
+                    message.insert(k, v);
+                }
+            }
+            let mut line = serde_json::to_string(&serde_json::Value::Object(message))
+                .map_err(|err| format!("could not encode the request: {err}"))?;
+            line.push('\n');
+
+            if let Err(err) = stream.write_all(line.as_bytes()) {
+                inner.pending.remove(&id);
+                return Err(format!("could not reach the DSH host: {err}"));
+            }
+            (id, rx)
+        };
+
+        match rx.recv_timeout(timeout) {
+            Ok(outcome) => Ok(outcome),
+            Err(_) => {
+                // Drop the waiter so a late reply is ignored rather than leaking.
+                self.inner.lock().unwrap().pending.remove(&id);
+                Err("the DSH host did not answer in time".into())
+            }
+        }
+    }
+
+    /// Resolve a waiter from a reply line.
+    fn settle(&self, id: &str, ok: bool, error: Option<String>) {
+        let waiter = self.inner.lock().unwrap().pending.remove(id);
+        if let Some(tx) = waiter {
+            let _ = tx.send((ok, error));
+        }
+    }
+
+    /// Clear the connection after a drop, failing any outstanding calls.
+    fn disconnect(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.stream = None;
+        inner.pending.clear();
+    }
+}
+
 /// Listen for bridge traffic, invoking `on_event` for events and `on_request`
 /// for requests.
 ///
@@ -219,7 +355,7 @@ pub fn parse_event(line: &str) -> Option<BridgeEvent> {
 ///
 /// Each connection is served on its own thread. Requests are answered on the
 /// asking connection, so a reply always reaches the plugin that made the call.
-pub fn listen<E, R>(on_event: E, on_request: R) -> std::io::Result<()>
+pub fn listen<E, R>(link: PluginLink, on_event: E, on_request: R) -> std::io::Result<()>
 where
     E: Fn(BridgeEvent) + Send + Clone + 'static,
     R: Fn(ShellRequest) -> Result<(), String> + Send + Clone + 'static,
@@ -252,6 +388,7 @@ where
                 };
                 let on_event = on_event.clone();
                 let on_request = on_request.clone();
+                let link = link.clone();
                 std::thread::spawn(move || {
                     // Split so the reader can block on lines while the same
                     // thread writes replies back.
@@ -262,6 +399,11 @@ where
                             return;
                         }
                     };
+                    // Publish this connection so the shell can send requests on
+                    // it. A reconnect replaces whatever was there.
+                    if let Ok(publish) = stream.try_clone() {
+                        link.inner.lock().unwrap().stream = Some(publish);
+                    }
                     let reader = BufReader::new(stream);
                     for line in reader.lines() {
                         let line = match line {
@@ -273,6 +415,9 @@ where
                         };
                         match parse_incoming(&line) {
                             Some(Incoming::Event(event)) => on_event(event),
+                            Some(Incoming::Reply { id, ok, error }) => {
+                                link.settle(&id, ok, error);
+                            }
                             Some(Incoming::Request { id, request }) => {
                                 // An unknown id means the plugin sent no id;
                                 // still answer so a caller waiting on a reply
@@ -302,6 +447,7 @@ where
                             None => {}
                         }
                     }
+                    link.disconnect();
                 });
             }
         })?;
@@ -320,6 +466,24 @@ pub fn cleanup() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_settings_event_carries_a_theme() {
+        let line = r#"{"kind":"settings","config":{"hotkey":"meta+alt+K","captionHeight":40}}"#;
+        let event = parse_event(line).expect("parse");
+        let theme = event.as_theme().expect("settings event must yield a theme");
+        assert_eq!(theme.hotkey, "meta+alt+K");
+        assert_eq!(theme.caption_height, 40);
+        // Omitted fields fall back to defaults rather than failing.
+        assert_eq!(theme.light, crate::theme::Palette::deepseek_light());
+    }
+
+    #[test]
+    fn a_non_settings_event_yields_no_theme() {
+        // Agent events must not be mistaken for configuration.
+        let event = parse_event(r#"{"kind":"status","status":"working"}"#).unwrap();
+        assert!(event.as_theme().is_none());
+    }
 
     #[test]
     fn parses_a_status_event() {

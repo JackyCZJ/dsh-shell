@@ -1,0 +1,327 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>DSH Shell Settings</title>
+<style>
+  /* Shell-owned settings window.
+     Uses the same tokens as the boot screen so it matches the shell chrome.
+     The form is generated from the live theme, so what is shown is what the
+     shell is actually using. */
+  :root {
+    --bg: #ffffff;
+    --surface: #f5f6f7;
+    --surface-hover: #e9ebed;
+    --border: #d9dcdf;
+    --text: #0f1115;
+    --muted: #81858c;
+    --accent: #4176e6;
+    --danger: #d93025;
+    --ok: #1a7f37;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  body { padding: 18px 20px 80px; }
+  h1 { font-size: 15px; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 18px; font-size: 12px; }
+  section { margin-bottom: 22px; }
+  h2 {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .07em;
+    color: var(--muted); font-weight: 600; margin: 0 0 10px;
+  }
+  .row {
+    display: flex; align-items: center; gap: 12px;
+    padding: 7px 0; border-bottom: .5px solid var(--border);
+  }
+  .row:last-child { border-bottom: 0; }
+  .row label { flex: 0 0 148px; }
+  .row .hint { color: var(--muted); font-size: 11px; margin-top: 3px; }
+  .grow { flex: 1; min-width: 0; }
+  input[type=text], input[type=number], select, textarea {
+    width: 100%; font: inherit; color: var(--text);
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 6px; padding: 5px 8px;
+  }
+  input:focus, select:focus, textarea:focus {
+    outline: 2px solid var(--accent); outline-offset: -1px; border-color: transparent;
+  }
+  textarea {
+    font-family: ui-monospace, Menlo, monospace; font-size: 12px;
+    min-height: 92px; resize: vertical;
+  }
+  input[type=color] {
+    width: 34px; height: 26px; padding: 0; border: 1px solid var(--border);
+    border-radius: 6px; background: none; cursor: pointer;
+  }
+  .swatch { display: flex; align-items: center; gap: 8px; }
+  .swatch code { font-size: 11px; color: var(--muted); min-width: 62px; }
+  .swatch label { flex: 0 0 148px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 22px; }
+  .inline { display: flex; gap: 8px; align-items: center; }
+  .inline input[type=number] { width: 76px; }
+  footer {
+    position: fixed; left: 0; right: 0; bottom: 0;
+    display: flex; align-items: center; gap: 10px;
+    padding: 12px 20px; background: var(--bg);
+    border-top: 1px solid var(--border);
+  }
+  footer .msg { flex: 1; font-size: 12px; }
+  footer .msg.ok { color: var(--ok); }
+  footer .msg.err { color: var(--danger); }
+  button {
+    font: inherit; padding: 6px 14px; border-radius: 6px; cursor: pointer;
+    border: 1px solid var(--border); background: var(--surface); color: var(--text);
+  }
+  button.primary { background: var(--accent); color: #fff; border-color: transparent; }
+  button:disabled { opacity: .5; cursor: default; }
+  details summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+  <h1>DSH Shell Settings</h1>
+  <p class="sub">
+    Stored in DSH's <code>settings.yaml</code> under the <code>dsh-shell</code>
+    namespace, and applied immediately — no restart. Light/dark follows DSH's own
+    Appearance setting.
+  </p>
+
+  <section>
+    <h2>Keyboard</h2>
+    <div class="row">
+      <label for="hotkey">Summon shortcut</label>
+      <div class="grow">
+        <input type="text" id="hotkey" spellcheck="false" placeholder="meta+shift+D">
+        <div class="hint" id="hotkey-hint">
+          At least one modifier is required. A combination another app owns is
+          rejected and the current shortcut is kept.
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Layout</h2>
+    <div class="row">
+      <label for="caption_height">Caption height</label>
+      <div class="grow inline">
+        <input type="number" id="caption_height" min="18" max="80">
+        <span class="hint">px reserved above the page for the drag strip</span>
+      </div>
+    </div>
+    <div class="row">
+      <label>Traffic lights</label>
+      <div class="grow inline">
+        x <input type="number" id="inset_x" min="0" max="400">
+        y <input type="number" id="inset_y" min="0" max="400">
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Colours</h2>
+    <details open>
+      <summary>Light</summary>
+      <div class="grid" id="light-grid"></div>
+    </details>
+    <details>
+      <summary>Dark</summary>
+      <div class="grid" id="dark-grid"></div>
+    </details>
+  </section>
+
+  <section>
+    <h2>Custom CSS</h2>
+    <textarea id="custom_css" spellcheck="false"
+      placeholder="body { --dsh-content-font-size: 15px; }"></textarea>
+    <div class="hint">Appended after the generated rules, so it wins.</div>
+  </section>
+
+  <footer>
+    <span class="msg" id="msg"></span>
+    <button id="revert">Revert</button>
+    <button id="save" class="primary">Save</button>
+  </footer>
+
+<script>
+  // The shell injects the live theme here before this script runs.
+  const INITIAL = window.__DSH_INITIAL__ || {};
+  // Writes go through the DSH host, so without one a save cannot succeed.
+  let hostConnected = window.__DSH_HOST_CONNECTED__ || false;
+
+  // Labels for the palette fields. The *keys* are derived from the data the
+  // shell sends, never hardcoded: hardcoding them once meant a renamed field
+  // was silently dropped from the saved config and fell back to a default,
+  // producing a half-wrong palette with no error anywhere.
+  const COLOUR_LABELS = {
+    background: 'Background',
+    surface: 'Surface',
+    surfaceHover: 'Surface hover',
+    border: 'Border',
+    text: 'Text',
+    textMuted: 'Muted text',
+    accent: 'Accent',
+  };
+
+  /** The palette field names actually present in the received theme. */
+  function colourKeys(palette) {
+    const keys = Object.keys(palette || {});
+    return keys.length > 0 ? keys : Object.keys(COLOUR_LABELS);
+  }
+
+  const labelFor = (key) =>
+    COLOUR_LABELS[key] ||
+    key.replace(/([A-Z])/g, ' $1').replace(/^./, (c) => c.toUpperCase());
+
+  const el = (id) => document.getElementById(id);
+  const msg = el('msg');
+
+  /** Build the colour rows for one palette. */
+  function buildPalette(name, palette) {
+    const grid = el(`${name}-grid`);
+    grid.innerHTML = '';
+    for (const key of colourKeys(palette)) {
+      const label = labelFor(key);
+      const wrap = document.createElement('div');
+      wrap.className = 'swatch';
+      wrap.style.padding = '6px 0';
+
+      const text = document.createElement('label');
+      text.textContent = label || key;
+
+      const input = document.createElement('input');
+      input.type = 'color';
+      input.id = `${name}_${key}`;
+
+      const code = document.createElement('code');
+      code.id = `${name}_${key}_code`;
+
+      input.addEventListener('input', () => {
+        code.textContent = input.value;
+      });
+
+      wrap.append(text, input, code);
+      grid.append(wrap);
+    }
+  }
+
+  // Built once the theme is known, so the rows reflect real field names.
+
+
+  /** Show the given theme in the form. */
+  function load(theme) {
+    // Rebuild the colour rows from the received object so the field names
+    // always match what the shell will accept back.
+    buildPalette('light', theme.light);
+    buildPalette('dark', theme.dark);
+    el('hotkey').value = theme.hotkey || 'meta+shift+D';
+    el('caption_height').value = theme.captionHeight ?? 34;
+    el('inset_x').value = theme.trafficLightInsetX ?? 20;
+    el('inset_y').value = theme.trafficLightInsetY ?? 20;
+    el('custom_css').value = theme.custom_css || '';
+
+    for (const name of ['light', 'dark']) {
+      const palette = theme[name] || {};
+      for (const key of colourKeys(palette)) {
+        const value = palette[key] || '#888888';
+        const input = el(`${name}_${key}`);
+        if (!input) continue;
+        input.value = value;
+        el(`${name}_${key}_code`).textContent = value;
+      }
+    }
+  }
+
+  /** Collect the form into a theme document. */
+  function collect() {
+    const palette = (name) => {
+      const out = {};
+      // Read back whatever rows were built, so the payload always carries the
+      // same field names the shell sent.
+      for (const key of colourKeys(INITIAL[name])) {
+        const input = el(`${name}_${key}`);
+        if (input) out[key] = input.value;
+      }
+      return out;
+    };
+    return {
+      hotkey: el('hotkey').value.trim(),
+      captionHeight: Number(el('caption_height').value),
+      trafficLightInsetX: Number(el('inset_x').value),
+      trafficLightInsetY: Number(el('inset_y').value),
+      light: palette('light'),
+      dark: palette('dark'),
+      customCss: el('custom_css').value,
+    };
+  }
+
+  function setMessage(text, kind) {
+    msg.textContent = text;
+    msg.className = 'msg' + (kind ? ' ' + kind : '');
+  }
+
+  /** Reflect whether a save is currently possible. */
+  function refreshSaveState() {
+    const save = el('save');
+    if (hostConnected) {
+      save.disabled = false;
+      save.title = '';
+    } else {
+      save.disabled = true;
+      save.title = 'The DSH host is not connected';
+    }
+  }
+
+  el('save').addEventListener('click', () => {
+    el('save').disabled = true;
+    setMessage('Saving…');
+    const config = collect();
+    if (window.ipc && window.ipc.postMessage) {
+      window.ipc.postMessage(JSON.stringify({ action: 'save', config }));
+    } else {
+      setMessage('No IPC bridge available', 'err');
+      el('save').disabled = false;
+    }
+  });
+
+  el('revert').addEventListener('click', () => {
+    load(INITIAL);
+  refreshSaveState();
+  if (!hostConnected) {
+    setMessage('The DSH host is not connected — saving is unavailable.', 'err');
+  }
+    setMessage('Reverted to the values loaded from disk.');
+  });
+
+  // Called by the shell after a save attempt.
+  window.__dshSettings = {
+    saved(ok, error) {
+      refreshSaveState();
+      if (ok) {
+        setMessage('Saved. Applied immediately.', 'ok');
+        // The shell also pushes the newly-written theme back, so the form shows
+        // exactly what was persisted rather than what was typed.
+      } else {
+        setMessage(error || 'Save failed', 'err');
+      }
+    },
+    // The shell pushes the live theme whenever it reloads, so an external edit
+    // to the document is reflected here too.
+    update(theme) {
+      load(theme);
+    },
+    // A pushed theme implies a live host, so a connection recovers the button.
+    setConnected(connected) {
+      hostConnected = !!connected;
+      refreshSaveState();
+    },
+  };
+
+  load(INITIAL);
+</script>
+</body>
+</html>

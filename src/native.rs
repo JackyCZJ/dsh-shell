@@ -63,6 +63,7 @@ pub struct Tray {
     _icon: TrayIcon,
     state_item: MenuItem,
     show_item: MenuItem,
+    settings_item: MenuItem,
     quit_item: MenuItem,
     pub state: AgentState,
     /// A short label contributed by a plugin, shown after the agent state.
@@ -78,12 +79,15 @@ impl Tray {
         let menu = Menu::new();
         let state_item = MenuItem::new("Agent: idle", false, None);
         let show_item = MenuItem::new("Show Window", true, None);
+        let settings_item = MenuItem::new("Settings…", true, None);
         let quit_item = MenuItem::new("Quit", true, None);
 
         menu.append_items(&[
             &state_item,
             &PredefinedMenuItem::separator(),
             &show_item,
+            &settings_item,
+            &PredefinedMenuItem::separator(),
             &quit_item,
         ])
         .map_err(|err| format!("tray menu: {err}"))?;
@@ -99,6 +103,7 @@ impl Tray {
             _icon: icon,
             state_item,
             show_item,
+            settings_item,
             quit_item,
             state: AgentState::Idle,
             plugin_label: None,
@@ -141,6 +146,10 @@ impl Tray {
 
     pub fn show_item_id(&self) -> &tray_icon::menu::MenuId {
         self.show_item.id()
+    }
+
+    pub fn settings_item_id(&self) -> &tray_icon::menu::MenuId {
+        self.settings_item.id()
     }
 
     pub fn quit_item_id(&self) -> &tray_icon::menu::MenuId {
@@ -399,57 +408,6 @@ mod tests {
     }
 
     #[test]
-    fn reads_dsh_theme_preference() {
-        // The real shape of a DSH settings document.
-        let yaml = "ui-onboarding:\n  welcomeNoticeVersion: 1\nui-theme:\n  preference: light\npet:\n  visible: true\n";
-        assert_eq!(parse_theme_preference(yaml), Some(false));
-
-        let yaml_dark = "ui-theme:\n  preference: dark\n";
-        assert_eq!(parse_theme_preference(yaml_dark), Some(true));
-    }
-
-    #[test]
-    fn system_preference_defers_to_the_os() {
-        // `system` must not be reported as an answer: the caller consults the OS.
-        assert_eq!(
-            parse_theme_preference("ui-theme:\n  preference: system\n"),
-            None
-        );
-        // A missing key is likewise not an answer.
-        assert_eq!(parse_theme_preference("ui-theme:\n  fontSize: 14\n"), None);
-        assert_eq!(parse_theme_preference(""), None);
-    }
-
-    #[test]
-    fn a_same_named_key_elsewhere_is_not_mistaken_for_the_theme() {
-        // Only a `preference` directly under `ui-theme` may count.
-        let yaml = "locale:\n  preference: dark\nui-theme:\n  fontSize: 14\n";
-        assert_eq!(
-            parse_theme_preference(yaml),
-            None,
-            "a preference under another top-level key must be ignored"
-        );
-    }
-
-    #[test]
-    fn commented_out_preferences_are_ignored() {
-        let yaml = "ui-theme:\n  # preference: dark\n  preference: light\n";
-        assert_eq!(parse_theme_preference(yaml), Some(false));
-    }
-
-    #[test]
-    fn quoted_values_are_accepted() {
-        assert_eq!(
-            parse_theme_preference("ui-theme:\n  preference: \"dark\"\n"),
-            Some(true)
-        );
-        assert_eq!(
-            parse_theme_preference("ui-theme:\n  preference: 'light'\n"),
-            Some(false)
-        );
-    }
-
-    #[test]
     fn whale_path_flattens_into_usable_polygons() {
         let polys = whale_polygons();
         assert!(!polys.is_empty(), "path produced no geometry");
@@ -628,6 +586,7 @@ pub fn notify(summary: &str, body: &str) {
 /// Menu events surfaced to the caller.
 pub enum TrayCommand {
     Show,
+    Settings,
     Quit,
 }
 
@@ -635,6 +594,8 @@ pub enum TrayCommand {
 pub fn tray_command(event: &MenuEvent, tray: &Tray) -> Option<TrayCommand> {
     if event.id == *tray.show_item_id() {
         Some(TrayCommand::Show)
+    } else if event.id == *tray.settings_item_id() {
+        Some(TrayCommand::Settings)
     } else if event.id == *tray.quit_item_id() {
         Some(TrayCommand::Quit)
     } else {
@@ -659,68 +620,6 @@ pub fn sanitize_label(label: Option<String>) -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
-}
-
-/// Read DSH's own theme preference from `$DSH_HOME/settings.yaml`.
-///
-/// This — not the OS — is authoritative for the page: DSH resolves
-/// `ui-theme.preference` and applies it to the document. The shell must match
-/// that or the window chrome and the page disagree.
-///
-/// Returns `None` when the file or key is absent, so the caller can fall back
-/// to the OS setting.
-pub fn dsh_theme_preference() -> Option<bool> {
-    let home = std::env::var("DSH_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|_| std::env::var("HOME").map(|h| std::path::PathBuf::from(h).join(".dsh")))
-        .ok()?;
-    let raw = std::fs::read_to_string(home.join("settings.yaml")).ok()?;
-    parse_theme_preference(&raw)
-}
-
-/// Extract `ui-theme.preference` from the settings document.
-///
-/// A deliberately small hand-rolled scan rather than a YAML dependency: the
-/// shell only needs this one value. The scan is line-based and only accepts the
-/// value when it sits directly under the `ui-theme` key, so a same-named key
-/// elsewhere cannot be mistaken for it.
-pub fn parse_theme_preference(yaml: &str) -> Option<bool> {
-    let mut in_theme_block = false;
-    for line in yaml.lines() {
-        let trimmed = line.trim_end();
-        if trimmed.trim().is_empty() || trimmed.trim_start().starts_with('#') {
-            continue;
-        }
-        let indent = trimmed.len() - trimmed.trim_start().len();
-
-        if indent == 0 {
-            // A new top-level key ends any block we were inside.
-            in_theme_block = trimmed.trim_start().starts_with("ui-theme:");
-            continue;
-        }
-        if !in_theme_block {
-            continue;
-        }
-        let body = trimmed.trim_start();
-        if let Some(value) = body.strip_prefix("preference:") {
-            let value = value.trim().trim_matches(|c| c == '"' || c == '\'');
-            return match value.to_ascii_lowercase().as_str() {
-                "dark" => Some(true),
-                "light" => Some(false),
-                // `system` is not an answer: the caller must consult the OS.
-                _ => None,
-            };
-        }
-    }
-    None
-}
-
-/// Resolve the appearance the shell should use.
-///
-/// DSH's preference wins when it is explicit; `system` (or an unreadable
-/// setting) defers to the OS.
-pub fn resolved_is_dark() -> bool {
-    dsh_theme_preference().unwrap_or_else(system_is_dark)
 }
 
 /// Read the operating system's current appearance.
@@ -834,7 +733,8 @@ pub fn is_summon_event(
     event.id == handle.hotkey().id()
 }
 
-/// A configurable keyboard shortcut, as written in `theme.json`.
+/// A configurable keyboard shortcut, as written in the `dsh-shell` settings
+/// namespace.
 ///
 /// Stored as text (`"meta+shift+D"`) rather than a serialized enum so the file
 /// stays readable and a typo produces a clear parse error instead of a silently
