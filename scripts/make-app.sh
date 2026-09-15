@@ -177,10 +177,40 @@ if [[ "$BUNDLE_RUNTIME" == "1" ]]; then
   echo "    runtime: $(du -sh "$DIST/Contents/Resources/runtime" | cut -f1)"
 fi
 
-# Ad-hoc sign so the bundle launches locally. Distribution needs a Developer ID
-# and notarization; see the README.
-codesign --force --deep --sign - "$DIST" 2>/dev/null || \
-  echo "note: ad-hoc signing skipped"
+# Signing.
+#
+# Not ad-hoc by default, because an ad-hoc signature has no Team ID and
+# `usernotificationsd` refuses to read such an app's record at all — it logs
+# "Couldn't get record to check entitlement key" and rejects every
+# `requestAuthorization`, so notifications silently do nothing. Everything else
+# in the app works ad-hoc, which is why this went unnoticed for so long.
+#
+# An identity is used when one exists. Ad-hoc stays the fallback so a machine
+# with no certificate can still build a bundle that runs.
+IDENTITY="${CODESIGN_IDENTITY:-}"
+if [[ -z "$IDENTITY" ]]; then
+  IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
+    | sed -n 's/^[^"]*"\(.*\)".*$/\1/p' | head -1)"
+fi
+
+if [[ -n "$IDENTITY" ]]; then
+  # The hardened runtime is only needed for notarization, and enabling it
+  # without the matching entitlements can break other things, so it is applied
+  # to a Developer ID build only.
+  if [[ "$IDENTITY" == Developer\ ID* ]]; then
+    echo "==> signing as: $IDENTITY (hardened runtime)"
+    codesign --force --deep --options runtime --sign "$IDENTITY" "$DIST"
+  else
+    echo "==> signing as: $IDENTITY"
+    codesign --force --deep --sign "$IDENTITY" "$DIST"
+  fi
+elif codesign --force --deep --sign - "$DIST" 2>/dev/null; then
+  echo "==> ad-hoc signed (no identity found)"
+  echo "    note: notifications will NOT work — the app has no Team ID, so the"
+  echo "          system refuses the request. Set CODESIGN_IDENTITY to sign."
+else
+  echo "note: signing skipped; the bundle may not launch"
+fi
 
 if [[ "$INSTALL" == "1" ]]; then
   echo "==> installing to /Applications"

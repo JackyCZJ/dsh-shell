@@ -391,24 +391,38 @@ double-click.
 
 ### Signing and notarization
 
+`make-app.sh` signs with the first codesigning identity it finds, or with
+`CODESIGN_IDENTITY` when set, and falls back to ad-hoc. **This is not only about
+Gatekeeper: notifications need a real signature.** An ad-hoc app has no Team ID,
+so `usernotificationsd` cannot read its code-signing record — it logs
+`Couldn't get record to check entitlement key` and refuses every
+`requestAuthorization`. The app then never appears in System Settings >
+Notifications and every notification is dropped without a word. Everything else
+works ad-hoc, which is why this is easy to miss.
+
+Signing with an Apple Development certificate is enough for notifications on the
+machine that owns it. Distributing to other machines still needs a Developer ID
+and notarization:
+
 ```sh
-codesign --force --deep --options runtime \
-  --sign "Developer ID Application: <name> (<team>)" "DSH Shell.app"
 xcrun notarytool submit "DSH Shell.app.zip" --keychain-profile <profile> --wait
 xcrun stapler staple "DSH Shell.app"
 ```
 
-- Notarization requires a paid Developer ID and the hardened runtime.
+- Notarization requires a paid Developer ID and the hardened runtime, which the
+  script applies only for a `Developer ID` identity.
 - Add the `com.apple.security.network.client` entitlement — the webview connects
   to the loopback host.
 - Re-sign after changing anything inside the bundle, or
   the signature is invalidated.
+- Changing the signing identity changes the Team ID, and the system treats that
+  as a different app: the notification permission has to be granted again.
 
 ## Development
 
 ```sh
 cargo run          # run from source
-cargo test         # 40 tests
+cargo test         # 112 tests
 cargo clippy       # lints
 ./scripts/make-icon.sh   # regenerate the .icns from the SVG
 ```
@@ -458,10 +472,8 @@ Everything below was exercised against a real DSH install on macOS 26 (arm64):
 - **No auto-update.** A new build has to be installed by hand.
 - **Language changes need a restart** for the tray and the app menu, which are
   built once at startup. The settings window picks up a change when reopened.
-- **A notification banner has not been seen on screen.** Permission is granted
-  and the system accepts the request without error, but no banner was caught in
-  any configuration testable without restarting the app that was hosting the
-  session. Confirm it after a restart.
+- **An unsigned (ad-hoc) build cannot notify**, by design of the platform. See
+  the signing section.
 - **A shell-script launcher breaks notifications.** With a wrapper as
   `CFBundleExecutable`, `usernotificationsd` reports *"Couldn't get record to
   check entitlement key"* and refuses the request, however the bundle is signed.
