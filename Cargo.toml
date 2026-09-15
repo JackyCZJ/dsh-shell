@@ -1,0 +1,40 @@
+[package]
+name = "dsh-shell"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Native desktop shell for the DeepSeek Harness web UI, with hot-reloadable theme"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "dsh-shell"
+path = "src/main.rs"
+
+[dependencies]
+# Windowing + native webview (WebKit on macOS, WebView2 on Windows, WebKitGTK on Linux)
+tao = "0.37"
+wry = "0.57"
+
+# Theme hot reload
+notify = "8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Launching and supervising `dsh web`
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "time", "sync"] }
+
+# Native desktop affordances
+tray-icon = "0.25"
+notify-rust = { version = "4", features = ["preview-macos-un"] }
+global-hotkey = "0.8"
+# Native app menu. Predefined items use the platform's own selectors, which is
+# what makes Cmd+C/V/X/A route to the focused webview.
+muda = "0.20"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,6 @@
+# Pinned so a clone builds with the same compiler this was developed against.
+# Verify the toolchain exists with `rustup toolchain list`; CI uses this too.
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]
+profile = "default"

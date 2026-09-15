@@ -1,0 +1,11 @@
+# Rust build output.
+/target
+
+# The assembled .app, rebuilt by scripts/make-app.sh.
+/dist
+
+# Generated from assets/deepseek.svg by scripts/make-icon.sh; the committed
+# deepseek.icns is the artifact, this is only the intermediate.
+/assets/icon.iconset
+
+.DS_Store
