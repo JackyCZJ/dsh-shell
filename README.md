@@ -43,6 +43,7 @@ runtime it was trying to avoid in the first place.
 | **Light / dark** | Follows DSH's `ui-theme.preference`, then the OS |
 | **Live settings** | Changes to the namespace update the chrome *and* the page, no restart |
 | **Settings window** | Tray → Settings…; writes go through DSH, which persists them |
+| **Follows DSH's language** | Chinese or English, from DSH's own `locale.preference` |
 | **Plugin bridge** | A real DSH Host plugin forwards `agent/*` events to the shell |
 
 ## Requirements
@@ -90,9 +91,6 @@ The shell has **no config file of its own**. Its settings live in DSH's
 ```yaml
 dsh-shell:
   hotkey: meta+shift+D
-  captionHeight: 34
-  trafficLightInsetX: 20
-  trafficLightInsetY: 20
   light:
     background: "#ffffff"
     surface: "#f5f6f7"
@@ -155,6 +153,31 @@ position: it mirrors DSH's preference and offers no override of its own.
 
 Both palettes are taken from **DSH's own boot-theme CSS** (`#151517` dark,
 `#ffffff` light), so the window chrome and the page share one colour.
+
+The caption-strip height and the traffic-light inset are **not configurable**.
+They are fixed chrome that has to line up with itself, and exposing them invited
+a broken drag strip far more easily than it enabled anything useful. They live as
+constants in `src/theme.rs`.
+
+## Language
+
+The shell follows DSH's own `locale.preference` from `settings.yaml`:
+
+```yaml
+locale:
+  preference: zh   # or en
+```
+
+Everything the shell owns is localised: the tray menu, the application menu, the
+settings window, the boot screen, and notifications. The strings live in
+`src/i18n.rs` as a struct per language, so a missing translation is a compile
+error rather than a blank label, and a test asserts the two tables differ.
+
+macOS localises the standard Edit items itself, so Cut/Copy/Paste keep working
+and appear in the system language whatever the shell is set to.
+
+> **A language change applies to the tray and menus on restart.** They are built
+> once at startup. The settings window picks the new language up when reopened.
 
 ## Keyboard
 

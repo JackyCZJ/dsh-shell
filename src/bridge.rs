@@ -469,11 +469,10 @@ mod tests {
 
     #[test]
     fn a_settings_event_carries_a_theme() {
-        let line = r#"{"kind":"settings","config":{"hotkey":"meta+alt+K","captionHeight":40}}"#;
+        let line = r#"{"kind":"settings","config":{"hotkey":"meta+alt+K"}}"#;
         let event = parse_event(line).expect("parse");
         let theme = event.as_theme().expect("settings event must yield a theme");
         assert_eq!(theme.hotkey, "meta+alt+K");
-        assert_eq!(theme.caption_height, 40);
         // Omitted fields fall back to defaults rather than failing.
         assert_eq!(theme.light, crate::theme::Palette::deepseek_light());
     }

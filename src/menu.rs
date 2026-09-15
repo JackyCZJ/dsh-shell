@@ -67,7 +67,8 @@ pub struct Section {
 /// main thread, which makes the real menu untestable. This description is pure
 /// data, so the structure — in particular whether the Edit items that bind
 /// Cmd+C/V are present — can be asserted in a test.
-pub fn description() -> Vec<Section> {
+pub fn description(locale: crate::i18n::Locale) -> Vec<Section> {
+    let t = locale.strings();
     vec![
         Section {
             title: "App",
@@ -81,13 +82,13 @@ pub fn description() -> Vec<Section> {
                 Entry::Predefined(Predefined::ShowAll),
                 Entry::Separator,
                 Entry::Shell {
-                    label: "Quit",
+                    label: t.quit,
                     id: ID_QUIT,
                 },
             ],
         },
         Section {
-            title: "Edit",
+            title: t.menu_edit,
             entries: vec![
                 Entry::Predefined(Predefined::Undo),
                 Entry::Predefined(Predefined::Redo),
@@ -100,10 +101,10 @@ pub fn description() -> Vec<Section> {
             ],
         },
         Section {
-            title: "View",
+            title: t.menu_view,
             entries: vec![
                 Entry::Shell {
-                    label: "Reload",
+                    label: t.menu_reload,
                     id: ID_RELOAD,
                 },
                 Entry::Separator,
@@ -111,13 +112,13 @@ pub fn description() -> Vec<Section> {
             ],
         },
         Section {
-            title: "Window",
+            title: t.menu_window,
             entries: vec![
                 Entry::Predefined(Predefined::Minimize),
                 Entry::Predefined(Predefined::Zoom),
                 Entry::Separator,
                 Entry::Shell {
-                    label: "Close Window",
+                    label: t.menu_close_window,
                     id: ID_SHOW,
                 },
             ],
@@ -132,10 +133,10 @@ pub fn description() -> Vec<Section> {
 ///
 /// Returns the menu plus the ids of items this shell must act on. The standard
 /// editing items are handled by the system and need no wiring.
-pub fn build(app_name: &str) -> Menu {
+pub fn build(app_name: &str, locale: crate::i18n::Locale) -> Menu {
     let menu = Menu::new();
 
-    for section in description() {
+    for section in description(locale) {
         // macOS treats a submenu named "Window" specially; the app menu takes
         // the application's name.
         let title = if section.title == "App" {
@@ -147,7 +148,9 @@ pub fn build(app_name: &str) -> Menu {
         for entry in &section.entries {
             let _ = match entry {
                 Entry::Separator => submenu.append(&PredefinedMenuItem::separator()),
-                Entry::Predefined(which) => submenu.append(&predefined_item(*which, app_name)),
+                Entry::Predefined(which) => {
+                    submenu.append(&predefined_item(*which, app_name, locale))
+                }
                 Entry::Shell { label, id } => {
                     let (key, mods) = shell_shortcut(id);
                     submenu.append(&shell_item(label, id, key, mods))
@@ -171,13 +174,21 @@ fn shell_shortcut(id: &str) -> (Code, Modifiers) {
 }
 
 /// Construct the platform item for a description entry.
-fn predefined_item(which: Predefined, app_name: &str) -> PredefinedMenuItem {
+fn predefined_item(
+    which: Predefined,
+    app_name: &str,
+    locale: crate::i18n::Locale,
+) -> PredefinedMenuItem {
+    let t = locale.strings();
     match which {
-        Predefined::About => {
-            PredefinedMenuItem::about(Some(&format!("About {app_name}")), None)
-        }
+        Predefined::About => PredefinedMenuItem::about(
+            Some(&crate::i18n::fill(t.menu_about, "app", app_name)),
+            None,
+        ),
         Predefined::Services => PredefinedMenuItem::services(None),
-        Predefined::Hide => PredefinedMenuItem::hide(Some(&format!("Hide {app_name}"))),
+        Predefined::Hide => {
+            PredefinedMenuItem::hide(Some(&crate::i18n::fill(t.menu_hide, "app", app_name)))
+        }
         Predefined::HideOthers => PredefinedMenuItem::hide_others(None),
         Predefined::ShowAll => PredefinedMenuItem::show_all(None),
         Predefined::Undo => PredefinedMenuItem::undo(None),
@@ -208,7 +219,7 @@ mod tests {
     use super::*;
 
     fn section(title: &str) -> Section {
-        description()
+        description(crate::i18n::Locale::En)
             .into_iter()
             .find(|s| s.title == title)
             .unwrap_or_else(|| panic!("no {title} section"))
@@ -238,15 +249,25 @@ mod tests {
     #[test]
     fn there_is_an_edit_section_at_all() {
         assert!(
-            description().iter().any(|s| s.title == "Edit"),
+            description(crate::i18n::Locale::En)
+                .iter()
+                .any(|s| s.title == "Edit"),
             "no Edit section; Cmd+C/V cannot be bound"
+        );
+        // The Chinese build must carry the Edit menu too, or the clipboard
+        // shortcuts would stop working the moment a user switched language.
+        assert!(
+            description(crate::i18n::Locale::Zh)
+                .iter()
+                .any(|s| s.title == crate::i18n::Locale::Zh.strings().menu_edit),
+            "no Edit section in Chinese"
         );
     }
 
     #[test]
     fn shell_items_have_unique_ids_and_shortcuts() {
         let mut ids = Vec::new();
-        for s in description() {
+        for s in description(crate::i18n::Locale::En) {
             for e in s.entries {
                 if let Entry::Shell { id, .. } = e {
                     assert!(!ids.contains(&id), "duplicate menu id {id}");
@@ -263,7 +284,7 @@ mod tests {
 
     #[test]
     fn separators_are_not_adjacent_and_do_not_lead() {
-        for s in description() {
+        for s in description(crate::i18n::Locale::En) {
             let first_is_sep = matches!(s.entries.first(), Some(Entry::Separator));
             assert!(!first_is_sep, "{} starts with a separator", s.title);
             for pair in s.entries.windows(2) {

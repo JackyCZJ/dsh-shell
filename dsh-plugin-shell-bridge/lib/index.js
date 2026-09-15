@@ -180,9 +180,6 @@ export const SETTINGS_NAMESPACE = 'dsh-shell'
  */
 export const SHELL_SETTINGS_DEFAULTS = deepFreeze({
   hotkey: 'meta+shift+D',
-  captionHeight: 34,
-  trafficLightInsetX: 20,
-  trafficLightInsetY: 20,
   light: {
     background: '#ffffff',
     surface: '#f5f6f7',
@@ -271,9 +268,6 @@ export function defineShellSettingsSchema(z) {
 
   return z.object({
     hotkey: z.string().default(SHELL_SETTINGS_DEFAULTS.hotkey),
-    captionHeight: z.number().default(SHELL_SETTINGS_DEFAULTS.captionHeight),
-    trafficLightInsetX: z.number().default(SHELL_SETTINGS_DEFAULTS.trafficLightInsetX),
-    trafficLightInsetY: z.number().default(SHELL_SETTINGS_DEFAULTS.trafficLightInsetY),
     // Copies, not the frozen originals: a schema default is data the resolver
     // may hand back, and the shared constant must stay the single source.
     light: palette().default({ ...SHELL_SETTINGS_DEFAULTS.light }),

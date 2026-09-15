@@ -25,7 +25,11 @@ const SETTINGS_HTML: &str = include_str!("../assets/settings.html");
 /// is populated on first paint with no round trip. `host_connected` tells the
 /// page whether a save can succeed at all: writes go through the Host, so with
 /// no Host attached the Save button must explain itself rather than fail.
-pub fn page(theme: &Theme, host_connected: bool) -> String {
+pub fn page(
+    theme: &Theme,
+    host_connected: bool,
+    locale: crate::i18n::Locale,
+) -> String {
     let json = serde_json::to_string(theme).unwrap_or_else(|_| "{}".into());
     // `</script>` inside the JSON would end the script block early. The theme
     // contains CSS text, which can legitimately include angle brackets.
@@ -35,6 +39,10 @@ pub fn page(theme: &Theme, host_connected: bool) -> String {
         .replace(
             "window.__DSH_HOST_CONNECTED__ || false",
             if host_connected { "true" } else { "false" },
+        )
+        .replace(
+            "window.__DSH_LOCALE__ || 'en'",
+            &format!("{:?}", locale.id()),
         )
 }
 
@@ -84,21 +92,6 @@ pub fn validate(config: &serde_json::Value) -> Result<Theme, String> {
     let theme: Theme = serde_json::from_value(config.clone())
         .map_err(|err| format!("invalid configuration: {err}"))?;
 
-    // Colour components are validated by `ColorHex` during deserialization, but
-    // the numeric fields need bounds the type cannot express.
-    if !(16..=96).contains(&theme.caption_height) {
-        return Err(format!(
-            "captionHeight must be between 16 and 96, got {}",
-            theme.caption_height
-        ));
-    }
-
-    if !(0.0..=400.0).contains(&theme.traffic_light_inset_x)
-        || !(0.0..=400.0).contains(&theme.traffic_light_inset_y)
-    {
-        return Err("trafficLightInsetX/Y must be between 0 and 400".into());
-    }
-
     // Reject a shortcut the shell could not register, rather than writing a file
     // that silently falls back to the default on the next start.
     crate::native::HotkeySpec::parse(&theme.hotkey)
@@ -120,12 +113,25 @@ mod tests {
     }
 
     #[test]
+    fn the_page_embeds_the_locale() {
+        let html = page(&Theme::default(), true, crate::i18n::Locale::Zh);
+        assert!(
+            html.contains("\"zh\""),
+            "locale was not injected into the page"
+        );
+        assert!(
+            !html.contains("window.__DSH_LOCALE__ || 'en'"),
+            "locale placeholder was not substituted"
+        );
+    }
+
+    #[test]
     fn the_page_embeds_the_live_theme() {
         let mut theme = Theme::default();
         theme.hotkey = "meta+alt+K".into();
         theme.light.accent = crate::theme::ColorHex(0x123456);
 
-        let html = page(&theme, true);
+        let html = page(&theme, true, crate::i18n::Locale::En);
         assert!(html.contains("meta+alt+K"), "hotkey missing from the page");
         assert!(html.contains("#123456"), "accent missing from the page");
         assert!(
@@ -144,7 +150,7 @@ mod tests {
         // custom_css is free text and can contain "</script>".
         let mut theme = Theme::default();
         theme.custom_css = "/* </script><script>alert(1)</script> */".into();
-        let html = page(&theme, false);
+        let html = page(&theme, false, crate::i18n::Locale::En);
         assert!(
             !html.contains("</script><script>alert(1)"),
             "a script tag in custom_css escaped the injection block"
@@ -182,15 +188,20 @@ mod tests {
     }
 
     #[test]
-    fn rejects_out_of_range_layout_values() {
-        let mut config = valid_config();
-        config["captionHeight"] = serde_json::json!(4);
-        assert!(validate(&config).unwrap_err().contains("captionHeight"));
-
-        let mut config = valid_config();
-        config["trafficLightInsetX"] = serde_json::json!(9000.0);
-        assert!(validate(&config).unwrap_err().contains("trafficLightInsetX"));
+    fn the_layout_values_are_not_part_of_the_configuration() {
+        // They are fixed chrome: a document that carries them must not change
+        // how the window is built.
+        let config = serde_json::json!({
+            "captionHeight": 900,
+            "trafficLightInsetX": -50.0,
+            "trafficLightInsetY": 9999.0,
+        });
+        assert!(
+            validate(&config).is_ok(),
+            "unknown layout keys must be ignored, not rejected"
+        );
     }
+
 
     #[test]
     fn rejects_oversized_custom_css() {
@@ -224,23 +235,20 @@ mod tests {
         // The settings document is camelCase, so the JSON crossing the wire must
         // be too. A snake_case name would silently fail to persist.
         let json = serde_json::to_value(Theme::default()).unwrap();
-        for key in ["captionHeight", "trafficLightInsetX", "customCss"] {
+        for key in ["hotkey", "customCss"] {
             assert!(json.get(key).is_some(), "missing {key} in {json}");
         }
         assert!(json["light"].get("surfaceHover").is_some());
 
         // And it must parse back from those names.
         let config = serde_json::json!({
-            "captionHeight": 44,
-            "trafficLightInsetX": 11.0,
+            "hotkey": "meta+alt+K",
             "customCss": "/* x */",
             "light": { "surfaceHover": "#abcdef" },
         });
         let theme = validate(&config).expect("camelCase config must validate");
-        assert_eq!(theme.caption_height, 44);
-        assert_eq!(theme.traffic_light_inset_x, 11.0);
+        assert_eq!(theme.hotkey, "meta+alt+K");
         assert_eq!(theme.light.surface_hover.0, 0xabcdef);
-        // Omitted fields fall back to defaults rather than failing.
-        assert_eq!(theme.hotkey, Theme::default().hotkey);
+        assert_eq!(theme.custom_css, "/* x */");
     }
 }

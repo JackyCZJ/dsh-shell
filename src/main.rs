@@ -11,6 +11,7 @@
 //! Theme edits apply live to both the native chrome and the page itself.
 
 mod bridge;
+mod i18n;
 mod menu;
 mod native;
 mod server;
@@ -32,6 +33,14 @@ use theme::{Theme, ThemeSource};
 /// Compiled in rather than read from disk so it cannot go missing in a packaged
 /// build, and so the first paint needs no file access.
 const BOOT_HTML: &str = include_str!("../assets/boot.html");
+
+/// The boot page with the shell's language baked in.
+///
+/// Substituted before the page's own script runs, so the first paint is already
+/// in the right language rather than flashing English.
+fn boot_page(locale: crate::i18n::Locale) -> String {
+    BOOT_HTML.replace("{locale}", &format!("{:?}", locale.id()))
+}
 
 /// How often to wake the event loop to drain background channels.
 ///
@@ -130,7 +139,7 @@ fn main() {
         tracing::warn!(%err, "bridge unavailable; tray and notifications will stay idle");
     }
 
-    let mut tray = match native::Tray::new() {
+    let mut tray = match native::Tray::new(theme_source.locale()) {
         Ok(tray) => Some(tray),
         Err(err) => {
             tracing::warn!(%err, "tray unavailable; continuing without it");
@@ -150,7 +159,7 @@ fn main() {
     // Without them macOS has nothing to bind Cmd+C/V/X/A to and the standard
     // clipboard shortcuts silently do nothing — the web view implements them,
     // but the system only routes them through the menu bar.
-    let app_menu = menu::build("DSH Shell");
+    let app_menu = menu::build("DSH Shell", theme_source.locale());
     #[cfg(target_os = "macos")]
     app_menu.init_for_nsapp();
     #[cfg(not(target_os = "macos"))]
@@ -178,8 +187,8 @@ fn main() {
             .with_title_hidden(true)
             .with_fullsize_content_view(true)
             .with_traffic_light_inset(tao::dpi::LogicalPosition::new(
-                theme_for_window.traffic_light_inset_x,
-                theme_for_window.traffic_light_inset_y,
+                theme::TRAFFIC_LIGHT_INSET.0,
+                theme::TRAFFIC_LIGHT_INSET.1,
             ));
     }
 
@@ -227,7 +236,7 @@ fn main() {
                 other => tracing::debug!(message = %other, "ignoring unknown shell IPC message"),
             }
         })
-        .with_html(BOOT_HTML)
+        .with_html(boot_page(theme_source.locale()))
         .build(&*window)
         .expect("build webview");
 
@@ -298,8 +307,8 @@ fn main() {
             )));
             #[cfg(target_os = "macos")]
             window.set_traffic_light_inset(tao::dpi::LogicalPosition::new(
-                theme.traffic_light_inset_x,
-                theme.traffic_light_inset_y,
+                theme::TRAFFIC_LIGHT_INSET.0,
+                theme::TRAFFIC_LIGHT_INSET.1,
             ));
             applied_theme = true;
         }
@@ -464,7 +473,10 @@ fn main() {
         while let Ok(request) = request_rx.try_recv() {
             match request {
                 bridge::ShellRequest::Notify { title, body } => {
+                    // A plugin-supplied title is its own copy and is passed
+                    // through untouched; only the fallback is the shell's.
                     native::notify(
+                        theme_source.locale(),
                         title.as_deref().unwrap_or("DSH"),
                         &body,
                     );
@@ -541,16 +553,17 @@ fn main() {
                     .as_deref()
                     .map(short_session)
                     .unwrap_or_else(|| "session".to_string());
+                let t = theme_source.locale().strings();
                 let (title, body) = match event.kind.as_str() {
                     "request-error" => (
-                        format!("DSH: {session} failed"),
+                        i18n::fill(t.notify_failed, "session", &session),
                         event
                             .message
                             .clone()
-                            .unwrap_or_else(|| "The agent hit an error.".into()),
+                            .unwrap_or_else(|| t.notify_errored.to_string()),
                     ),
                     _ => (
-                        format!("DSH: {session} finished"),
+                        i18n::fill(t.notify_finished, "session", &session),
                         // Prefer an explicit reason ("end_turn", "cancelled")
                         // over a generic message: it tells the user whether the
                         // agent completed or stopped early.
@@ -558,11 +571,11 @@ fn main() {
                             .message
                             .clone()
                             .or_else(|| event.reason.clone())
-                            .map(|r| format!("Stopped: {r}"))
-                            .unwrap_or_else(|| "The agent is done.".into()),
+                            .map(|r| i18n::fill(t.notify_stopped, "reason", &r))
+                            .unwrap_or_else(|| t.notify_done.to_string()),
                     ),
                 };
-                native::notify(&title, &body);
+                native::notify(theme_source.locale(), &title, &body);
             }
         }
 
@@ -636,10 +649,11 @@ fn main() {
                 event: WindowEvent::Resized(_),
                 ..
             } => {
-                let t = theme_source.current();
+                // Re-assert the fixed inset: macOS resets it across some
+                // fullscreen transitions.
                 window.set_traffic_light_inset(tao::dpi::LogicalPosition::new(
-                    t.traffic_light_inset_x,
-                    t.traffic_light_inset_y,
+                    theme::TRAFFIC_LIGHT_INSET.0,
+                    theme::TRAFFIC_LIGHT_INSET.1,
                 ));
             }
             _ => {}
@@ -704,7 +718,7 @@ fn open_settings(
 
     let theme = theme_source.current();
     let builder = tao::window::WindowBuilder::new()
-        .with_title("DSH Shell Settings")
+        .with_title(theme_source.locale().strings().settings_window_title)
         .with_inner_size(tao::dpi::LogicalSize::new(620.0, 720.0))
         .with_min_inner_size(tao::dpi::LogicalSize::new(480.0, 420.0));
 
@@ -718,7 +732,11 @@ fn open_settings(
 
     let tx = tx.clone();
     let webview = wry::WebViewBuilder::new()
-        .with_html(settings::page(&theme, link.is_connected()))
+        .with_html(settings::page(
+            &theme,
+            link.is_connected(),
+            theme_source.locale(),
+        ))
         .with_ipc_handler(move |request| {
             let body = request.body().to_string();
             match settings::parse_request(&body) {
@@ -780,8 +798,8 @@ fn apply_theme_to_chrome(window: &tao::window::Window, theme: &Theme, is_dark: b
     )));
     #[cfg(target_os = "macos")]
     window.set_traffic_light_inset(tao::dpi::LogicalPosition::new(
-        theme.traffic_light_inset_x,
-        theme.traffic_light_inset_y,
+        theme::TRAFFIC_LIGHT_INSET.0,
+        theme::TRAFFIC_LIGHT_INSET.1,
     ));
     window.request_redraw();
 }
@@ -933,6 +951,18 @@ mod tests {
         // The payload must be JSON-escaped, not raw.
         assert!(script.contains("\\\"a\\\\\\\"b\\\""), "expected escaping: {script}");
         assert!(!script.contains("\nbody {"), "raw newline leaked into script");
+    }
+
+    #[test]
+    fn the_boot_page_carries_the_locale() {
+        let zh = boot_page(crate::i18n::Locale::Zh);
+        assert!(zh.contains("\"zh\""), "locale missing from the boot page");
+        assert!(
+            !zh.contains("{locale}"),
+            "boot page placeholder was not substituted"
+        );
+        let en = boot_page(crate::i18n::Locale::En);
+        assert!(en.contains("\"en\""));
     }
 
     #[test]

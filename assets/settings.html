@@ -83,73 +83,126 @@
 </style>
 </head>
 <body>
-  <h1>DSH Shell Settings</h1>
-  <p class="sub">
-    Stored in DSH's <code>settings.yaml</code> under the <code>dsh-shell</code>
-    namespace, and applied immediately — no restart. Light/dark follows DSH's own
-    Appearance setting.
-  </p>
+  <h1 data-i18n="title">DSH Shell Settings</h1>
+  <p class="sub" data-i18n="subtitle"></p>
 
   <section>
-    <h2>Keyboard</h2>
+    <h2 data-i18n="keyboard">Keyboard</h2>
     <div class="row">
-      <label for="hotkey">Summon shortcut</label>
+      <label for="hotkey" data-i18n="summon">Summon shortcut</label>
       <div class="grow">
         <input type="text" id="hotkey" spellcheck="false" placeholder="meta+shift+D">
-        <div class="hint" id="hotkey-hint">
-          At least one modifier is required. A combination another app owns is
-          rejected and the current shortcut is kept.
-        </div>
+        <div class="hint" id="hotkey-hint" data-i18n="summonHint"></div>
       </div>
     </div>
   </section>
 
   <section>
-    <h2>Layout</h2>
-    <div class="row">
-      <label for="caption_height">Caption height</label>
-      <div class="grow inline">
-        <input type="number" id="caption_height" min="18" max="80">
-        <span class="hint">px reserved above the page for the drag strip</span>
-      </div>
-    </div>
-    <div class="row">
-      <label>Traffic lights</label>
-      <div class="grow inline">
-        x <input type="number" id="inset_x" min="0" max="400">
-        y <input type="number" id="inset_y" min="0" max="400">
-      </div>
-    </div>
-  </section>
-
-  <section>
-    <h2>Colours</h2>
+    <h2 data-i18n="colours">Colours</h2>
     <details open>
-      <summary>Light</summary>
+      <summary data-i18n="light">Light</summary>
       <div class="grid" id="light-grid"></div>
     </details>
     <details>
-      <summary>Dark</summary>
+      <summary data-i18n="dark">Dark</summary>
       <div class="grid" id="dark-grid"></div>
     </details>
   </section>
 
   <section>
-    <h2>Custom CSS</h2>
+    <h2 data-i18n="customCss">Custom CSS</h2>
     <textarea id="custom_css" spellcheck="false"
       placeholder="body { --dsh-content-font-size: 15px; }"></textarea>
-    <div class="hint">Appended after the generated rules, so it wins.</div>
+    <div class="hint" data-i18n="cssHint"></div>
   </section>
 
   <footer>
     <span class="msg" id="msg"></span>
-    <button id="revert">Revert</button>
-    <button id="save" class="primary">Save</button>
+    <button id="revert" data-i18n="revert">Revert</button>
+    <button id="save" class="primary" data-i18n="save">Save</button>
   </footer>
 
 <script>
   // The shell injects the live theme here before this script runs.
   const INITIAL = window.__DSH_INITIAL__ || {};
+
+  // Strings for both languages the shell speaks. Held here, then applied to the
+  // document, so the window is readable the moment it opens.
+  const MESSAGES = {
+    en: {
+      title: 'DSH Shell Settings',
+      subtitle: "Stored in DSH's settings.yaml under the dsh-shell namespace, and applied immediately — no restart. Light/dark follows DSH's own Appearance setting.",
+      keyboard: 'Keyboard',
+      summon: 'Summon shortcut',
+      summonHint: 'At least one modifier is required. A combination another app owns is rejected and the current shortcut is kept.',
+      colours: 'Colours',
+      light: 'Light',
+      dark: 'Dark',
+      customCss: 'Custom CSS',
+      cssHint: 'Appended after the generated rules, so it wins.',
+      save: 'Save',
+      revert: 'Revert',
+      saving: 'Saving…',
+      saved: 'Saved. Applied immediately.',
+      saveFailed: 'Save failed',
+      reverted: 'Reverted to the values loaded from disk.',
+      noIpc: 'No IPC bridge available',
+      hostDown: 'The DSH host is not connected — saving is unavailable.',
+      noHostTitle: 'The DSH host is not connected',
+      surfaceHover: 'Surface hover',
+      textMuted: 'Muted text',
+      background: 'Background',
+      surface: 'Surface',
+      border: 'Border',
+      text: 'Text',
+      accent: 'Accent',
+    },
+    zh: {
+      title: 'DSH Shell 设置',
+      subtitle: '保存在 DSH 的 settings.yaml 中 dsh-shell 命名空间下，修改后立即生效，无需重启。亮/暗色跟随 DSH 自身的外观设置。',
+      keyboard: '键盘',
+      summon: '唤起快捷键',
+      summonHint: '至少需要一个修饰键。若组合已被其他应用占用，会拒绝并保留当前快捷键。',
+      colours: '颜色',
+      light: '亮色',
+      dark: '暗色',
+      customCss: '自定义 CSS',
+      cssHint: '追加在生成规则之后，因此优先级最高。',
+      save: '保存',
+      revert: '还原',
+      saving: '保存中…',
+      saved: '已保存，立即生效。',
+      saveFailed: '保存失败',
+      reverted: '已还原为从磁盘读取的值。',
+      noIpc: 'IPC 桥不可用',
+      hostDown: 'DSH host 未连接 — 无法保存。',
+      noHostTitle: 'DSH host 未连接',
+      surfaceHover: '悬停表面',
+      textMuted: '次要文字',
+      background: '背景',
+      surface: '表面',
+      border: '边框',
+      text: '文字',
+      accent: '强调色',
+    },
+  };
+  let LANG = window.__DSH_LOCALE__ || 'en';
+  const t = (key) => (MESSAGES[LANG] || MESSAGES.en)[key] || key;
+
+  /** Apply the strings to the static parts of the document. */
+  function applyStrings() {
+    document.documentElement.lang = LANG;
+    document.title = t('title');
+    document.querySelectorAll('[data-i18n]').forEach((el) => {
+      const key = el.getAttribute('data-i18n');
+      const value = t(key);
+      if (value) el.textContent = value;
+    });
+    document.querySelectorAll('[data-i18n-title]').forEach((el) => {
+      const value = t(el.getAttribute('data-i18n-title'));
+      if (value) el.title = value;
+    });
+  }
   // Writes go through the DSH host, so without one a save cannot succeed.
   let hostConnected = window.__DSH_HOST_CONNECTED__ || false;
 
@@ -157,25 +210,26 @@
   // shell sends, never hardcoded: hardcoding them once meant a renamed field
   // was silently dropped from the saved config and fell back to a default,
   // producing a half-wrong palette with no error anywhere.
-  const COLOUR_LABELS = {
-    background: 'Background',
-    surface: 'Surface',
-    surfaceHover: 'Surface hover',
-    border: 'Border',
-    text: 'Text',
-    textMuted: 'Muted text',
-    accent: 'Accent',
+  const COLOUR_LABEL_KEYS = {
+    background: 'background',
+    surface: 'surface',
+    surfaceHover: 'surfaceHover',
+    border: 'border',
+    text: 'text',
+    textMuted: 'textMuted',
+    accent: 'accent',
   };
 
   /** The palette field names actually present in the received theme. */
   function colourKeys(palette) {
     const keys = Object.keys(palette || {});
-    return keys.length > 0 ? keys : Object.keys(COLOUR_LABELS);
+    return keys.length > 0 ? keys : Object.keys(COLOUR_LABEL_KEYS);
   }
 
-  const labelFor = (key) =>
-    COLOUR_LABELS[key] ||
-    key.replace(/([A-Z])/g, ' $1').replace(/^./, (c) => c.toUpperCase());
+  const labelFor = (key) => {
+    const dictKey = COLOUR_LABEL_KEYS[key];
+    return (dictKey && t(dictKey)) || key;
+  };
 
   const el = (id) => document.getElementById(id);
   const msg = el('msg');
@@ -219,9 +273,6 @@
     buildPalette('light', theme.light);
     buildPalette('dark', theme.dark);
     el('hotkey').value = theme.hotkey || 'meta+shift+D';
-    el('caption_height').value = theme.captionHeight ?? 34;
-    el('inset_x').value = theme.trafficLightInsetX ?? 20;
-    el('inset_y').value = theme.trafficLightInsetY ?? 20;
     el('custom_css').value = theme.custom_css || '';
 
     for (const name of ['light', 'dark']) {
@@ -250,9 +301,6 @@
     };
     return {
       hotkey: el('hotkey').value.trim(),
-      captionHeight: Number(el('caption_height').value),
-      trafficLightInsetX: Number(el('inset_x').value),
-      trafficLightInsetY: Number(el('inset_y').value),
       light: palette('light'),
       dark: palette('dark'),
       customCss: el('custom_css').value,
@@ -272,29 +320,25 @@
       save.title = '';
     } else {
       save.disabled = true;
-      save.title = 'The DSH host is not connected';
+      save.title = t('noHostTitle');
     }
   }
 
   el('save').addEventListener('click', () => {
     el('save').disabled = true;
-    setMessage('Saving…');
+    setMessage(t('saving'));
     const config = collect();
     if (window.ipc && window.ipc.postMessage) {
       window.ipc.postMessage(JSON.stringify({ action: 'save', config }));
     } else {
-      setMessage('No IPC bridge available', 'err');
+      setMessage(t('noIpc'), 'err');
       el('save').disabled = false;
     }
   });
 
   el('revert').addEventListener('click', () => {
     load(INITIAL);
-  refreshSaveState();
-  if (!hostConnected) {
-    setMessage('The DSH host is not connected — saving is unavailable.', 'err');
-  }
-    setMessage('Reverted to the values loaded from disk.');
+    setMessage(t('reverted'));
   });
 
   // Called by the shell after a save attempt.
@@ -302,11 +346,11 @@
     saved(ok, error) {
       refreshSaveState();
       if (ok) {
-        setMessage('Saved. Applied immediately.', 'ok');
+        setMessage(t('saved'), 'ok');
         // The shell also pushes the newly-written theme back, so the form shows
         // exactly what was persisted rather than what was typed.
       } else {
-        setMessage(error || 'Save failed', 'err');
+        setMessage(error || t('saveFailed'), 'err');
       }
     },
     // The shell pushes the live theme whenever it reloads, so an external edit
@@ -321,7 +365,13 @@
     },
   };
 
+  // Strings first, so the static chrome is localised before anything renders.
+  applyStrings();
   load(INITIAL);
+  refreshSaveState();
+  if (!hostConnected) {
+    setMessage(t('hostDown'), 'err');
+  }
 </script>
 </body>
 </html>

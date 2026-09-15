@@ -94,7 +94,7 @@
       </svg>
       <div class="wordmark">DEEPSEEK HARNESS</div>
       <div class="spinner" id="spinner"></div>
-      <div class="hint" id="hint">正在启动本地运行时…</div>
+      <div class="hint" id="hint"></div>
       <div class="failed" id="failed">
         <div class="hint" id="failed-text"></div>
         <div class="detail" id="failed-detail"></div>
@@ -104,7 +104,30 @@
 <script>
   // The shell calls these over the IPC bridge to reflect real startup state
   // instead of leaving an indefinite spinner when something goes wrong.
+  // Baked in by the shell before this script runs, so the first paint is
+  // already in the right language instead of flashing English.
+  window.__DSH_LOCALE__ = {locale};
+  // Strings for the languages the shell speaks. Kept here rather than fetched
+  // because this page renders before any Host is available.
+  var MESSAGES = {
+    en: { starting: 'Starting the local runtime…', failed: 'Could not start the local runtime' },
+    zh: { starting: '正在启动本地运行时…', failed: '无法启动本地运行时' }
+  };
+  var LANG = window.__DSH_LOCALE__ || 'en';
+  function t(key) { return (MESSAGES[LANG] || MESSAGES.en)[key]; }
+
+  var hintEl = document.getElementById('hint');
+  if (hintEl) hintEl.textContent = t('starting');
+
   window.__dshBoot = {
+    // The shell may correct the language once it has read DSH's setting.
+    setLocale: function (lang) {
+      if (MESSAGES[lang]) {
+        LANG = lang;
+        var el = document.getElementById('hint');
+        if (el && el.style.display !== 'none') el.textContent = t('starting');
+      }
+    },
     setHint: function (text) {
       var el = document.getElementById('hint');
       if (el) el.textContent = text;
@@ -116,8 +139,9 @@
       if (hint) hint.style.display = 'none';
       var box = document.getElementById('failed');
       if (box) box.style.display = 'flex';
-      var t = document.getElementById('failed-text');
-      if (t) t.textContent = text;
+      var el = document.getElementById('failed-text');
+      // A caller-supplied message wins; otherwise the localised default.
+      if (el) el.textContent = text || t('failed');
       var d = document.getElementById('failed-detail');
       if (d) d.textContent = detail || '';
     },

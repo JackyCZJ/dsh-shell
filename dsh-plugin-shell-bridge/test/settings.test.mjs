@@ -37,9 +37,6 @@ process.env.DSH_SHELL_SOCKET = path.join(
 /** The section exactly as it is documented, independent of the implementation. */
 const DOCUMENTED = {
   hotkey: 'meta+shift+D',
-  captionHeight: 34,
-  trafficLightInsetX: 20,
-  trafficLightInsetY: 20,
   light: {
     background: '#ffffff',
     surface: '#f5f6f7',
@@ -178,7 +175,6 @@ test('the schema resolves a fresh or partial section to the documented defaults'
 
   // DSH owns validation, so the schema must actually refuse bad values rather
   // than silently coercing them.
-  assert.throws(() => schema({ captionHeight: 'tall' }))
   assert.throws(() => schema({ light: { accent: 5 } }))
 })
 

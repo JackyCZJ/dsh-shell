@@ -21,6 +21,20 @@ use serde::{Deserialize, Serialize};
 /// The namespace this crate reads from the settings document.
 pub const SETTINGS_NAMESPACE: &str = "dsh-shell";
 
+/// Height of the draggable caption strip, in CSS pixels.
+///
+/// Deliberately not configurable. It is a fixed part of the window chrome, and
+/// exposing it invited a broken drag strip — the traffic lights would end up
+/// over the page, or the strip would not line up with them — far more easily
+/// than it enabled anything useful.
+pub const CAPTION_HEIGHT: u32 = 34;
+
+/// Inset of the traffic lights from the window's top-left, in CSS pixels.
+///
+/// Also not configurable, for the same reason: it has to match the strip above,
+/// and the macOS default is what looks native.
+pub const TRAFFIC_LIGHT_INSET: (f64, f64) = (20.0, 20.0);
+
 /// A color stored as `#rrggbb`.
 ///
 /// Parsing is strict so a typo surfaces as a readable error rather than a
@@ -114,11 +128,6 @@ impl Palette {
 pub struct Theme {
     /// The global shortcut that summons the window, e.g. `"meta+shift+D"`.
     pub hotkey: String,
-    /// Height of the draggable caption strip, in CSS pixels.
-    pub caption_height: u32,
-    /// Inset of the traffic lights from the window's top-left.
-    pub traffic_light_inset_x: f64,
-    pub traffic_light_inset_y: f64,
     #[serde(default = "Palette::deepseek_light")]
     pub light: Palette,
     #[serde(default = "Palette::deepseek_dark")]
@@ -131,11 +140,6 @@ impl Default for Theme {
     fn default() -> Self {
         Theme {
             hotkey: "meta+shift+D".to_string(),
-            caption_height: 34,
-            // Matches the default macOS inset so the buttons look native until
-            // the user moves them.
-            traffic_light_inset_x: 20.0,
-            traffic_light_inset_y: 20.0,
             light: Palette::deepseek_light(),
             dark: Palette::deepseek_dark(),
             custom_css: String::new(),
@@ -245,7 +249,7 @@ body {{
             text = p.text.css(),
             muted = p.text_muted.css(),
             accent = p.accent.css(),
-            caption = self.caption_height,
+            caption = CAPTION_HEIGHT,
             custom = self.custom_css,
         )
     }
@@ -276,6 +280,8 @@ pub struct ThemeSource {
     /// Last successfully loaded theme, so a broken or partial document keeps the
     /// current look on screen instead of blanking the app.
     last_good: Arc<Mutex<Arc<Theme>>>,
+    /// DSH's own `locale.preference`, when the shell speaks it.
+    locale: Arc<Mutex<crate::i18n::Locale>>,
     /// DSH's own `ui-theme.preference`, when it names light or dark.
     ///
     /// Read from the same document because it is what DSH applies to the page:
@@ -290,6 +296,7 @@ impl ThemeSource {
         let source = ThemeSource {
             path,
             last_good: Arc::new(Mutex::new(Arc::new(Theme::default()))),
+            locale: Arc::new(Mutex::new(crate::i18n::Locale::default())),
             dsh_prefers_dark: Arc::new(Mutex::new(None)),
         };
         let _ = source.reload();
@@ -311,8 +318,14 @@ impl ThemeSource {
             }
         };
 
-        // DSH's preference is read even when our own section is unchanged, since
-        // it decides which palette is active.
+        // The locale is read even when our own section is unchanged: it is a DSH
+        // preference, not part of `dsh-shell`.
+        if let Some(locale) = crate::i18n::Locale::from_settings_yaml(&raw) {
+            *self.locale.lock().unwrap() = locale;
+        }
+
+        // DSH's theme preference is read for the same reason: it decides which
+        // palette is active.
         let preference = Theme::dsh_preference_from_yaml(&raw);
         let preference_changed = {
             let mut current = self.dsh_prefers_dark.lock().unwrap();
@@ -362,6 +375,11 @@ impl ThemeSource {
         self.last_good.lock().unwrap().clone()
     }
 
+    /// The language the shell should speak.
+    pub fn locale(&self) -> crate::i18n::Locale {
+        *self.locale.lock().unwrap()
+    }
+
     /// Whether the shell should render dark.
     ///
     /// DSH's `ui-theme.preference` wins when it is explicit; the OS is consulted
@@ -377,6 +395,7 @@ impl ThemeSource {
         ThemeSource {
             path: self.path.clone(),
             last_good: self.last_good.clone(),
+            locale: self.locale.clone(),
             dsh_prefers_dark: self.dsh_prefers_dark.clone(),
         }
     }
@@ -462,9 +481,6 @@ llm-pi-ai:
 dsh-shell:
   appearance: dark
   hotkey: meta+alt+K
-  captionHeight: 40
-  trafficLightInsetX: 12.5
-  trafficLightInsetY: 30
   light:
     background: "#fafafa"
     surface: "#f0f0f0"
@@ -485,12 +501,32 @@ dsh-shell:
 "##;
 
     #[test]
+    fn follows_the_dsh_locale_setting() {
+        let src = ThemeSource::new("/nonexistent/does/not/exist/settings.yaml");
+        // Defaults to English with nothing to go on.
+        assert_eq!(src.locale(), crate::i18n::Locale::En);
+
+        let dir = std::env::temp_dir().join("dsh-shell-locale-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.yaml");
+        std::fs::write(&path, "locale:\n  preference: zh\n").unwrap();
+
+        let src = ThemeSource::new(&path);
+        assert_eq!(src.locale(), crate::i18n::Locale::Zh);
+
+        // A change is picked up on reload, like every other DSH preference.
+        std::fs::write(&path, "locale:\n  preference: en\n").unwrap();
+        src.reload();
+        assert_eq!(src.locale(), crate::i18n::Locale::En);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn reads_the_namespace_from_a_real_document() {
         let theme = Theme::from_settings_yaml(DOCUMENT).expect("parse");
         assert_eq!(theme.hotkey, "meta+alt+K");
-        assert_eq!(theme.caption_height, 40);
-        assert_eq!(theme.traffic_light_inset_x, 12.5);
-        assert_eq!(theme.traffic_light_inset_y, 30.0);
         assert_eq!(theme.light.accent.0, 0xff0000);
         assert_eq!(theme.dark.accent.0, 0x00ff00);
         assert_eq!(theme.light.surface_hover.0, 0xe0e0e0);
@@ -525,7 +561,6 @@ dsh-shell:
         let theme =
             Theme::from_settings_yaml("dsh-shell:\n  hotkey: control+alt+J\n").expect("parse");
         assert_eq!(theme.hotkey, "control+alt+J");
-        assert_eq!(theme.caption_height, Theme::default().caption_height);
         assert_eq!(theme.light, Palette::deepseek_light());
     }
 
@@ -557,9 +592,6 @@ dsh-shell:
         let value = serde_json::to_value(Theme::default()).expect("serialize");
         for key in [
             "hotkey",
-            "captionHeight",
-            "trafficLightInsetX",
-            "trafficLightInsetY",
             "customCss",
             "light",
             "dark",
@@ -622,12 +654,13 @@ dsh-shell:
     fn injected_css_carries_tokens_and_caption_height() {
         let mut theme = Theme::default();
         theme.light.accent = ColorHex(0xff0000);
-        theme.caption_height = 40;
         theme.custom_css = "/* custom */".into();
 
         let css = theme.injected_css(false);
         assert!(css.contains("#ff0000"));
-        assert!(css.contains("--dsh-shell-caption-height: 40px"));
+        assert!(css.contains(&format!(
+            "--dsh-shell-caption-height: {CAPTION_HEIGHT}px"
+        )));
         assert!(css.contains("padding-top: var(--dsh-shell-caption-height)"));
         assert!(css.trim_end().ends_with("/* custom */"));
     }

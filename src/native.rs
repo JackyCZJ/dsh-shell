@@ -49,11 +49,13 @@ impl AgentState {
         }
     }
 
-    pub fn label(self) -> &'static str {
+    /// The localised name for this state.
+    pub fn label(self, locale: crate::i18n::Locale) -> &'static str {
+        let t = locale.strings();
         match self {
-            AgentState::Idle => "idle",
-            AgentState::Working => "working",
-            AgentState::Failed => "failed",
+            AgentState::Idle => t.agent_idle,
+            AgentState::Working => t.agent_working,
+            AgentState::Failed => t.agent_failed,
         }
     }
 }
@@ -68,6 +70,7 @@ pub struct Tray {
     pub state: AgentState,
     /// A short label contributed by a plugin, shown after the agent state.
     plugin_label: Option<String>,
+    locale: crate::i18n::Locale,
 }
 
 impl Tray {
@@ -75,12 +78,17 @@ impl Tray {
     ///
     /// `on_show` and `on_quit` are invoked from the tray's own event thread;
     /// the menu ids below are what the caller matches on.
-    pub fn new() -> Result<Tray, String> {
+    pub fn new(locale: crate::i18n::Locale) -> Result<Tray, String> {
+        let t = locale.strings();
         let menu = Menu::new();
-        let state_item = MenuItem::new("Agent: idle", false, None);
-        let show_item = MenuItem::new("Show Window", true, None);
-        let settings_item = MenuItem::new("Settings…", true, None);
-        let quit_item = MenuItem::new("Quit", true, None);
+        let state_item = MenuItem::new(
+            format!("{}: {}", t.agent_prefix, t.agent_idle),
+            false,
+            None,
+        );
+        let show_item = MenuItem::new(t.show_window, true, None);
+        let settings_item = MenuItem::new(t.settings, true, None);
+        let quit_item = MenuItem::new(t.quit, true, None);
 
         menu.append_items(&[
             &state_item,
@@ -94,7 +102,7 @@ impl Tray {
 
         let icon = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
-            .with_tooltip("DSH Shell")
+            .with_tooltip(t.notification_app)
             .with_icon(make_icon(AgentState::Idle))
             .build()
             .map_err(|err| format!("tray icon: {err}"))?;
@@ -107,6 +115,7 @@ impl Tray {
             quit_item,
             state: AgentState::Idle,
             plugin_label: None,
+            locale,
         })
     }
 
@@ -136,9 +145,11 @@ impl Tray {
 
 /// Recompute the tray text from the agent state and any plugin label.
     fn refresh_label(&mut self) {
+        let t = self.locale.strings();
+        let state = self.state.label(self.locale);
         let text = match &self.plugin_label {
-            Some(label) => format!("Agent: {} — {label}", self.state.label()),
-            None => format!("Agent: {}", self.state.label()),
+            Some(label) => format!("{}: {state} — {label}", t.agent_prefix),
+            None => format!("{}: {state}", t.agent_prefix),
         };
         self.state_item.set_text(text.clone());
         let _ = self._icon.set_tooltip(Some(text));
@@ -571,11 +582,11 @@ mod tests {
 ///
 /// Failures are logged, never returned: a missing notification daemon should
 /// not disturb the shell.
-pub fn notify(summary: &str, body: &str) {
+pub fn notify(locale: crate::i18n::Locale, summary: &str, body: &str) {
     if let Err(err) = notify_rust::Notification::new()
         .summary(summary)
         .body(body)
-        .appname("DSH Shell")
+        .appname(locale.strings().notification_app)
         .timeout(notify_rust::Timeout::Milliseconds(6000))
         .show()
     {
