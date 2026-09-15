@@ -12,11 +12,14 @@
 
 mod bridge;
 mod i18n;
+mod instance;
 mod menu;
 mod native;
+mod runtime;
 mod server;
 mod settings;
 mod theme;
+mod window_state;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -61,6 +64,13 @@ const ZOOM_MESSAGE: &str = "dsh-shell:zoom";
 /// movable instead of leaving a silent dead zone if injection failed.
 const READY_MESSAGE: &str = "dsh-shell:drag-ready";
 
+/// The shortest gap between two window-geometry writes.
+///
+/// Dragging or resizing produces an event per frame, and each save replaces a
+/// file. Half a second keeps the file close to current without turning a drag
+/// into hundreds of writes.
+const GEOMETRY_WRITE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -68,6 +78,27 @@ fn main() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+
+    // One shell per user session, claimed before anything else is started.
+    //
+    // The order matters: a second shell must not reach the point of launching
+    // its own host or binding the bridge socket, because that is what would
+    // leave two hosts running and the two processes fighting over one socket
+    // path. So the slot is claimed first and everything below assumes it.
+    let (instance_activations, _instance_guard) =
+        match instance::claim(&runtime::lock_path(), &runtime::activate_path()) {
+            Ok(instance::Claim::Owned { guard, activations }) => (activations, guard),
+            Ok(instance::Claim::HandedOff) => {
+                tracing::info!("another shell is already running; asked it to show its window");
+                return;
+            }
+            Err(err) => {
+                // Refusing to start is the safe failure: starting anyway risks
+                // exactly the two-shell collision the lock exists to prevent.
+                tracing::error!(%err, "could not claim the single-instance slot");
+                std::process::exit(1);
+            }
+        };
 
     let dsh_program = std::env::var("DSH_BIN").unwrap_or_else(|_| "dsh".to_string());
     let port: u16 = std::env::var("DSH_PORT")
@@ -172,10 +203,37 @@ fn main() {
     let event_loop = EventLoopBuilder::new().build();
     let theme_for_window = theme_source.current();
 
+    // Where the window was last time. Resolved once: the paths do not change
+    // while the shell runs, and reading the environment per write would be both
+    // slower and surprising.
+    let state_path = window_state::path();
+    let saved = match state_path.as_deref() {
+        Some(path) => window_state::load(path),
+        None => window_state::WindowState::default(),
+    };
+
+    // A saved position is only worth restoring if it still lands on a display
+    // the user has. Undocking a laptop would otherwise open the window on a
+    // monitor that is no longer attached, where it cannot be reached.
+    let monitors = logical_monitors(&event_loop);
+    let restored = if saved.is_reachable(&monitors) {
+        saved.clamped_to(&monitors)
+    } else {
+        tracing::info!("saved window position is off-screen; centring instead");
+        window_state::WindowState::default()
+    };
+
     let mut builder = WindowBuilder::new()
         .with_title("DeepSeek Harness")
-        .with_inner_size(LogicalSize::new(1280.0, 840.0))
-        .with_min_inner_size(LogicalSize::new(720.0, 480.0));
+        .with_inner_size(LogicalSize::new(restored.width, restored.height))
+        .with_min_inner_size(LogicalSize::new(
+            window_state::MIN_WIDTH,
+            window_state::MIN_HEIGHT,
+        ));
+
+    if let (Some(x), Some(y)) = (restored.x, restored.y) {
+        builder = builder.with_position(tao::dpi::LogicalPosition::new(x, y));
+    }
 
     // No system titlebar: transparent and hidden, with the content running the
     // full height of the frame. The traffic lights stay visible so the window is
@@ -193,6 +251,17 @@ fn main() {
     }
 
     let window = builder.build(&event_loop).expect("build window");
+
+    // Measured before anything can resize the window, so `inner_size` and
+    // `outer_size` agree and their difference is the real border.
+    let chrome = WindowChrome::measure(&window);
+    tracing::debug!(?chrome, "measured the window border");
+
+    // Maximizing after the build rather than through the builder keeps the
+    // restore path identical to the user pressing the zoom button.
+    if restored.maximized {
+        window.set_maximized(true);
+    }
 
     // With the system titlebar hidden there is no OS drag region left, so the
     // page itself has to ask the window to move. A thin strip along the top is
@@ -266,6 +335,13 @@ fn main() {
     let mut navigated = false;
     let mut server: Option<server::DshServer> = None;
 
+    // Remembered window geometry. `last_geometry` is what has actually been
+    // written; a resize or move only marks it dirty, so a drag costs one write
+    // rather than one per frame.
+    let mut last_geometry = restored;
+    let mut geometry_dirty = false;
+    let mut geometry_written_at = std::time::Instant::now();
+
     let main_window_id = window.id();
     // The settings window is created on demand and dropped when closed.
     let mut settings_window: Option<SettingsWindow> = None;
@@ -316,6 +392,16 @@ fn main() {
             window.request_redraw();
         }
 
+        // --- Second launch handed off to us -------------------------------
+        //
+        // The lock made the new launch exit; this is the other half of it. The
+        // window is raised rather than merely focused, because the request
+        // usually comes from someone who cannot see the app at all.
+        while instance_activations.try_recv().is_ok() {
+            summon(&window);
+            tracing::info!("a second launch handed off; window shown");
+        }
+
         // --- Tray events --------------------------------------------------
         //
         // Drained here rather than on the tray's own thread because window
@@ -323,10 +409,7 @@ fn main() {
         while let Ok(event) = tray_menu_rx.try_recv() {
             if let Some(active) = tray.as_ref() {
                 match native::tray_command(&event, active) {
-                    Some(native::TrayCommand::Show) => {
-                        window.set_visible(true);
-                        window.set_focus();
-                    }
+                    Some(native::TrayCommand::Show) => summon(&window),
                     Some(native::TrayCommand::Settings) => {
                         open_settings(
                             &mut settings_window,
@@ -338,7 +421,7 @@ fn main() {
                     }
                     Some(native::TrayCommand::Quit) => {
                         shutdown_server(&mut server);
-                        bridge::cleanup();
+                        runtime::cleanup();
                         *control_flow = ControlFlow::Exit;
                         return;
                     }
@@ -357,7 +440,7 @@ fn main() {
                 menu::ID_QUIT => {
                     tracing::info!("quit from the application menu");
                     shutdown_server(&mut server);
-                    bridge::cleanup();
+                    runtime::cleanup();
                     *control_flow = ControlFlow::Exit;
                     return;
                 }
@@ -389,9 +472,7 @@ fn main() {
                 if native::is_summon_event(&event, active) {
                     // Summon rather than merely focus: the point of the shortcut
                     // is to reach the app when it is hidden behind others.
-                    window.set_visible(true);
-                    window.set_minimized(false);
-                    window.set_focus();
+                    summon(&window);
                     tracing::info!("summoned by global hotkey");
                 }
             }
@@ -481,11 +562,7 @@ fn main() {
                         &body,
                     );
                 }
-                bridge::ShellRequest::FocusWindow => {
-                    window.set_visible(true);
-                    window.set_minimized(false);
-                    window.set_focus();
-                }
+                bridge::ShellRequest::FocusWindow => summon(&window),
                 bridge::ShellRequest::HideWindow => {
                     window.set_visible(false);
                 }
@@ -638,27 +715,169 @@ fn main() {
                     // No tray to restore from, so closing must quit — otherwise
                     // the app would be unreachable.
                     shutdown_server(&mut server);
-                    bridge::cleanup();
+                    runtime::cleanup();
                     *control_flow = ControlFlow::Exit;
                 }
             }
-            // Re-assert the traffic-light inset: macOS resets it on some
-            // fullscreen and resize transitions.
-            #[cfg(target_os = "macos")]
+            // A resize both needs the traffic-light inset re-asserted (macOS
+            // resets it across some fullscreen and resize transitions) and
+            // changes what should be remembered.
             Event::WindowEvent {
                 event: WindowEvent::Resized(_),
                 ..
             } => {
-                // Re-assert the fixed inset: macOS resets it across some
-                // fullscreen transitions.
+                #[cfg(target_os = "macos")]
                 window.set_traffic_light_inset(tao::dpi::LogicalPosition::new(
                     theme::TRAFFIC_LIGHT_INSET.0,
                     theme::TRAFFIC_LIGHT_INSET.1,
                 ));
+                geometry_dirty = true;
+            }
+            Event::WindowEvent {
+                event: WindowEvent::Moved(_),
+                ..
+            } => {
+                geometry_dirty = true;
+            }
+            // macOS only. Clicking the dock icon while the window is hidden must
+            // bring it back: the window hides to the tray on close, so without
+            // this the icon looks broken — the app is running, and nothing
+            // happens.
+            #[cfg(target_os = "macos")]
+            Event::Reopen { .. } => {
+                summon(&window);
+                tracing::info!("reopened from the dock");
             }
             _ => {}
         }
+
+        // Persist the geometry, but not on every frame of a drag.
+        //
+        // The write is debounced rather than deferred to exit: a window that is
+        // hidden to the tray and then lost to a crash should still reopen where
+        // it was.
+        if geometry_dirty && geometry_written_at.elapsed() >= GEOMETRY_WRITE_INTERVAL {
+            if let Some(path) = state_path.as_deref() {
+                let next = capture_geometry(&window, &chrome, &last_geometry);
+                window_state::save(path, &next);
+                last_geometry = next;
+            }
+            geometry_dirty = false;
+            geometry_written_at = std::time::Instant::now();
+        }
     });
+}
+
+/// Bring the window back: visible, un-minimized, and in front.
+///
+/// Every path that raises the window wants all three — a summon shortcut, a
+/// tray click, a plugin asking for focus, a second launch, a dock click — and
+/// `set_visible` alone leaves a minimized window minimized.
+fn summon(window: &tao::window::Window) {
+    window.set_visible(true);
+    window.set_minimized(false);
+    window.set_focus();
+    // The window may have been hidden or occluded, in which case the page has
+    // no reason to have repainted.
+    window.request_redraw();
+}
+
+/// The window's non-content border, measured once while the geometry is settled.
+///
+/// `inner_size()` reads the content view's frame, which AppKit has not yet
+/// updated by the time a resize event is delivered — sampling it during a drag
+/// therefore returns the *previous* size, and a resize would never be saved.
+/// `outer_size()` is current, so the content size is derived from it by
+/// subtracting this border.
+///
+/// The border is zero for the main window, which is borderless. It is measured
+/// rather than assumed so that a port to a platform where the shell keeps a
+/// native titlebar does not drift by the titlebar height on every restart.
+#[derive(Debug, Clone, Copy)]
+struct WindowChrome {
+    width: u32,
+    height: u32,
+}
+
+impl WindowChrome {
+    /// Measure the border from a window whose size has stopped changing.
+    fn measure(window: &tao::window::Window) -> Self {
+        let outer = window.outer_size();
+        let inner = window.inner_size();
+        Self {
+            width: outer.width.saturating_sub(inner.width),
+            height: outer.height.saturating_sub(inner.height),
+        }
+    }
+
+    /// The content size in physical pixels, derived from the current frame.
+    fn content_size(&self, window: &tao::window::Window) -> tao::dpi::PhysicalSize<u32> {
+        let outer = window.outer_size();
+        tao::dpi::PhysicalSize::new(
+            outer.width.saturating_sub(self.width),
+            outer.height.saturating_sub(self.height),
+        )
+    }
+}
+
+/// The current window rectangle, in logical units.
+///
+/// While maximized or fullscreen the size is deliberately kept from
+/// `previous`: the platform reports the maximized size, and saving that would
+/// make the window restore at full screen size even after it is un-maximized.
+fn capture_geometry(
+    window: &tao::window::Window,
+    chrome: &WindowChrome,
+    previous: &window_state::WindowState,
+) -> window_state::WindowState {
+    let scale = window.scale_factor();
+    let mut next = *previous;
+
+    if !window.is_maximized() {
+        let size = chrome.content_size(window).to_logical::<f64>(scale);
+        next.width = size.width;
+        next.height = size.height;
+    }
+    if let Ok(position) = window.outer_position() {
+        let position = position.to_logical::<f64>(scale);
+        next.x = Some(position.x);
+        next.y = Some(position.y);
+    }
+    next.maximized = window.is_maximized();
+    tracing::debug!(
+        width = next.width,
+        height = next.height,
+        x = next.x,
+        y = next.y,
+        maximized = next.maximized,
+        scale,
+        outer = ?window.outer_size(),
+        "captured window geometry"
+    );
+    next
+}
+
+/// Every monitor as a logical `(x, y, width, height)` rectangle.
+///
+/// Logical units because that is what the saved state is in: mixing the two
+/// would scale a restored window by the display's density factor.
+fn logical_monitors(
+    event_loop: &tao::event_loop::EventLoopWindowTarget<()>,
+) -> Vec<(f64, f64, f64, f64)> {
+    event_loop
+        .available_monitors()
+        .map(|monitor| {
+            let scale = monitor.scale_factor();
+            let position = monitor.position();
+            let size = monitor.size();
+            (
+                position.x as f64 / scale,
+                position.y as f64 / scale,
+                size.width as f64 / scale,
+                size.height as f64 / scale,
+            )
+        })
+        .collect()
 }
 
 /// Shorten a session id for display.

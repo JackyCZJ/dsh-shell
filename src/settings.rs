@@ -160,6 +160,9 @@ mod tests {
     #[test]
     fn accepts_the_default_configuration() {
         let theme = validate(&valid_config()).expect("default must validate");
+        // Validation must round-trip the document, not merely accept it: a
+        // dropped field would silently save a truncated configuration.
+        assert_eq!(theme, Theme::default());
     }
 
     #[test]

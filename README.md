@@ -44,6 +44,9 @@ runtime it was trying to avoid in the first place.
 | **Live settings** | Changes to the namespace update the chrome *and* the page, no restart |
 | **Settings window** | Tray → Settings…; writes go through DSH, which persists them |
 | **Follows DSH's language** | Chinese or English, from DSH's own `locale.preference` |
+| **Single instance** | A second launch raises the running window instead of starting a second shell |
+| **Remembers the window** | Size, position, and zoom come back on the next launch |
+| **Dock reopen** | Clicking the dock icon restores a hidden or minimized window |
 | **Plugin bridge** | A real DSH Host plugin forwards `agent/*` events to the shell |
 
 ## Requirements
@@ -81,6 +84,10 @@ Distribution to other machines needs a Developer ID and notarization — see
 | `DSH_PORT` | `0` | Port for `dsh web`; `0` lets the OS choose |
 | `DSH_SETTINGS` | `$DSH_HOME/settings.yaml` | Settings document to read |
 | `DSH_HOME` | `~/.dsh` | DSH home; locates `settings.yaml` |
+| `DSH_SHELL_SOCKET` | `$TMPDIR/dsh-shell-<uid>.sock` | Bridge socket (the plugin honours it too) |
+| `DSH_SHELL_LOCK` | `$TMPDIR/dsh-shell-<uid>.lock` | Single-instance lock file |
+| `DSH_SHELL_ACTIVATE` | `$TMPDIR/dsh-shell-<uid>.activate.sock` | Handoff socket |
+| `DSH_SHELL_WINDOW_STATE` | `$DSH_HOME/cache/dsh-shell/window.json` | Remembered window rectangle |
 | `RUST_LOG` | `info` | Log filter |
 
 ## Configuration lives in DSH
@@ -240,14 +247,42 @@ src/
   native.rs  tray, notifications, global hotkey, appearance detection
   server.rs  spawns `dsh web`, parses its URL, kills it on exit
   bridge.rs  the shell's side of the plugin bridge
+  instance.rs single-instance lock and the handoff to a running shell
+  runtime.rs where the shell's per-user runtime files live
   settings.rs the settings window
   theme.rs   tokens, settings.yaml reading, watcher
+  window_state.rs the remembered window rectangle
 assets/
   boot.html       the loading screen
   deepseek.svg    DSH's official icon
   deepseek.icns   built from the SVG for the bundle
 # configuration lives in DSH's settings.yaml
 ```
+
+### Runtime files
+
+A running shell owns three files in `$XDG_RUNTIME_DIR` (on macOS, the per-user
+temp directory), all namespaced by uid:
+
+| File | Purpose |
+|---|---|
+| `dsh-shell-<uid>.sock` | the bridge the Host plugin dials |
+| `dsh-shell-<uid>.lock` | the `flock` that makes a second launch a handoff |
+| `dsh-shell-<uid>.activate.sock` | how that second launch asks the first to raise its window |
+
+The lock file is deliberately never deleted. Only the lock on it matters, and
+unlinking it would be a race: a launch that had just opened the path would hold
+a lock on an inode with no name, while a later launch would create a fresh inode
+and lock that — leaving two shells each believing it was the only one.
+`DSH_SHELL_SOCKET`, `DSH_SHELL_LOCK`, and `DSH_SHELL_ACTIVATE` override the
+paths, which is how the handoff is tested without disturbing a live session.
+
+The window rectangle is *state*, not configuration, so it lives outside DSH's
+settings document, in `$DSH_HOME/cache/dsh-shell/window.json`. Deleting it only
+reopens the window at its default size. It is written about twice a second while
+you drag rather than at exit, so a window lost to a crash still reopens where it
+was; a position that no longer lands on an attached display is discarded rather
+than applied off-screen.
 
 ### Two threading rules
 
@@ -351,7 +386,7 @@ Everything below was exercised against a real DSH install on macOS 26 (arm64):
 
 | Part | Evidence |
 |---|---|
-| Builds | `cargo build` clean, zero warnings, 40 tests passing |
+| Builds | `cargo build` clean, zero warnings, 112 tests passing |
 | Window | Hidden titlebar, inset traffic lights, drag strip |
 | Renders DSH | Full web UI — sidebar, conversations, composer, cost meter |
 | Host supervision | Spawns `dsh web --no-open`, parses its authenticated URL |
@@ -363,15 +398,25 @@ Everything below was exercised against a real DSH install on macOS 26 (arm64):
 | **Boot screen** | Visible during startup, then transitions to the app |
 | **Bundle** | `make-app.sh` output launches through `open` |
 | **Finder launch** | Starts its host under a minimal PATH |
+| **Single instance** | Second launch exited `0`, logged the handoff, and left exactly one host running |
+| **Handoff raises** | Window minimized → second launch → un-minimized, not merely focused |
+| **Window state** | Resized to 1000×640 at (300, 120), `kill -9`'d, relaunched at exactly that rectangle |
+| **Dock reopen** | Window minimized → `open -a` (the reopen event) → `AXMinimized` `true` → `false` |
 
 ## Known gaps
 
-- **Windows and Linux are untested.** The code compiles for them and uses the
-  platform webview, but only macOS has been run. The app menu is attached
-  app-globally on macOS only.
+- **macOS is the only platform that builds.** The bridge and the
+  single-instance handoff are both Unix-socket based, so Windows needs a
+  different transport before it can compile at all — the README previously
+  claimed Windows built, which was wrong. Linux shares the Unix facilities and
+  should build, but has never been run: neither target is installed here, so
+  neither is checked. Only macOS has actually been exercised.
 - **Shipped builds need a DSH install.** Bundling the runtime is documented above
   but not automated.
 - **Not notarized.** Local use only until a Developer ID is applied.
+- **No auto-update.** A new build has to be installed by hand.
+- **Language changes need a restart** for the tray and the app menu, which are
+  built once at startup. The settings window picks up a change when reopened.
 
 ## Licence
 

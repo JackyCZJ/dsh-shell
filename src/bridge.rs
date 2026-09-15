@@ -10,7 +10,6 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -213,33 +212,6 @@ impl BridgeEvent {
     }
 }
 
-/// Resolve the socket path, matching the plugin's own resolution.
-pub fn socket_path() -> PathBuf {
-    if let Ok(explicit) = std::env::var("DSH_SHELL_SOCKET") {
-        return PathBuf::from(explicit);
-    }
-    let run_dir = std::env::var("XDG_RUNTIME_DIR")
-        .ok()
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    // SAFETY: getuid cannot fail.
-    let uid = unsafe { libc_getuid() };
-    run_dir.join(format!("dsh-shell-{uid}.sock"))
-}
-
-#[cfg(unix)]
-unsafe fn libc_getuid() -> u32 {
-    unsafe extern "C" {
-        fn getuid() -> u32;
-    }
-    unsafe { getuid() }
-}
-
-#[cfg(not(unix))]
-unsafe fn libc_getuid() -> u32 {
-    0
-}
-
 /// Parse one newline-delimited JSON line.
 ///
 /// Separated from the socket loop so the wire format is testable.
@@ -360,11 +332,14 @@ where
     E: Fn(BridgeEvent) + Send + Clone + 'static,
     R: Fn(ShellRequest) -> Result<(), String> + Send + Clone + 'static,
 {
-    let path = socket_path();
+    let path = crate::runtime::socket_path();
 
-    // A leftover socket from an unclean exit would make bind fail. Removing it
-    // is safe: if another live process owned it, that process is gone, because
-    // the shell holds exactly one listener per user.
+    // A leftover socket from an unclean exit would make bind fail, so it is
+    // cleared first. That is safe because the single-instance lock is already
+    // held: `crate::instance::claim` runs before this and guarantees no other
+    // live shell owns the path, so the file can only be a dead process's
+    // remains. Without that lock this removal would let a second shell steal
+    // the first one's socket.
     if path.exists() {
         let _ = std::fs::remove_file(&path);
     }
@@ -453,14 +428,6 @@ where
         })?;
 
     Ok(())
-}
-
-/// Remove the socket file, so a clean exit leaves nothing behind.
-pub fn cleanup() {
-    let path = socket_path();
-    if path.exists() {
-        let _ = std::fs::remove_file(&path);
-    }
 }
 
 #[cfg(test)]
@@ -609,7 +576,7 @@ mod tests {
     fn socket_path_is_short_enough_for_unix_sockets() {
         // macOS caps socket paths near 104 bytes; a long home dir must not
         // silently produce an unusable path.
-        let path = socket_path();
+        let path = crate::runtime::socket_path();
         assert!(
             path.as_os_str().len() < 100,
             "socket path too long: {}",
