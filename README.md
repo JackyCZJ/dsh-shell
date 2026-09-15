@@ -453,7 +453,7 @@ Everything below was exercised against a real DSH install on macOS 26 (arm64):
 | **Handoff raises** | Window minimized → second launch → un-minimized, not merely focused |
 | **Window state** | Resized to 1000×640 at (300, 120), `kill -9`'d, relaunched at exactly that rectangle |
 | **Dock reopen** | Window minimized → `open -a` (the reopen event) → `AXMinimized` `true` → `false` |
-| **Notification permission** | `requestAuthorization` returned *granted*; the previous backend never registered the app at all |
+| **Notifications** | A banner appeared with the shell's title, body, and whale icon; the previous backend delivered nothing at all |
 
 ## Known gaps
 
@@ -473,7 +473,22 @@ Everything below was exercised against a real DSH install on macOS 26 (arm64):
 - **Language changes need a restart** for the tray and the app menu, which are
   built once at startup. The settings window picks up a change when reopened.
 - **An unsigned (ad-hoc) build cannot notify**, by design of the platform. See
-  the signing section.
+  the signing section. `make-app.sh` warns when it falls back to ad-hoc.
+
+### Debugging notifications
+
+A note for whoever looks at this next, because it cost a long detour:
+
+- **`defaults read com.apple.ncprefs` is not a reliable list of apps that can
+  notify on current macOS.** Apps that had just shown the permission prompt —
+  one of which had already delivered a notification — do not appear in it, even
+  after `killall cfprefsd`. Treating its absence as "not registered" sends you
+  chasing signatures and bundle identifiers that are not the problem.
+- **The permission prompt is not instant.** It can arrive several seconds after
+  launch, behind the app's own window. Concluding "no prompt appeared" too early
+  is easy.
+- Failure is logged with the `NSError` on the `warn` level, so run with
+  `RUST_LOG=debug` (or watch for the warning) rather than guessing.
 - **A shell-script launcher breaks notifications.** With a wrapper as
   `CFBundleExecutable`, `usernotificationsd` reports *"Couldn't get record to
   check entitlement key"* and refuses the request, however the bundle is signed.
