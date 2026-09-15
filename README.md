@@ -35,7 +35,7 @@ runtime it was trying to avoid in the first place.
 | **No system titlebar** | Transparent titlebar, full-size content, inset traffic lights |
 | **Window dragging** | A drag strip over the caption area, since no OS drag region remains |
 | **Native app menu** | Standard Edit menu, so ⌘C/⌘V/⌘X/⌘A work |
-| **Tray icon** | Agent state (idle / working / failed) as a colour-coded whale |
+| **Tray icon** | Agent state (idle / working / failed) as a colour-coded whale, rasterised at 2x and antialiased |
 | **Global hotkey** | **⌘⇧D** summons the window from anywhere |
 | **Desktop notifications** | On turn completion and on failure |
 | **Close to tray** | Closing hides; the host and session keep running |

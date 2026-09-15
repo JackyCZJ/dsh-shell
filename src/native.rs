@@ -176,45 +176,73 @@ impl Tray {
 /// colour art.
 const WHALE_PATH: &str = include_str!("../assets/whale_path.txt");
 
+/// Rasterisation size of the tray glyph, in pixels.
+///
+/// tray-icon always fits the image to 18 points tall — the menu bar's standard
+/// height — so this number is the only lever on sharpness: it decides how many
+/// pixels that 18 points is drawn from. 36 is exactly 2x, which is what a Retina
+/// bar wants; the previous 22 was upscaled by 1.6x and looked it.
+const ICON_SIZE: u32 = 36;
+
+/// Samples taken per axis within each pixel when rasterising.
+///
+/// One sample per pixel gives a hard 1-bit edge, and at 18 points the whale's
+/// curves then read as a jagged outline. Taking several and using the fraction
+/// covered as alpha smooths it without pulling in a real rasteriser.
+const SUPERSAMPLE: u32 = 4;
+
 /// Rasterise the whale at the given size, tinted for the agent state.
 ///
 /// The mask is computed from the SVG path with a scanline fill, so the tray and
 /// the Dock icon cannot drift apart.
 fn make_icon(state: AgentState) -> Icon {
-    const SIZE: u32 = 22;
     let [r, g, b, a] = state.color();
-    let mask = whale_mask(SIZE);
-    let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);
-    for value in mask {
-        if value {
-            rgba.extend_from_slice(&[r, g, b, a]);
-        } else {
-            rgba.extend_from_slice(&[0, 0, 0, 0]);
-        }
+    let mut rgba = Vec::with_capacity((ICON_SIZE * ICON_SIZE * 4) as usize);
+    for coverage in whale_coverage() {
+        // Alpha carries the shape so the edges stay soft; the colour stays the
+        // state's, which is what makes the tray readable at a glance.
+        let alpha = (a as f32 * coverage).round() as u8;
+        rgba.extend_from_slice(&[r, g, b, alpha]);
     }
-    Icon::from_rgba(rgba, SIZE, SIZE).expect("generated icon is valid")
+    Icon::from_rgba(rgba, ICON_SIZE, ICON_SIZE).expect("generated icon is valid")
 }
 
-/// Rasterise the whale silhouette into a boolean mask.
+/// Per-pixel coverage of the whale silhouette, 0.0 to 1.0.
 ///
-/// A point-in-polygon test on the path's outline. Doing this at runtime keeps
-/// the tray in step with `assets/deepseek.svg` without a build-time rasteriser
-/// or a committed PNG that could go stale.
-fn whale_mask(size: u32) -> Vec<bool> {
+/// Computed once: it depends only on [`ICON_SIZE`], and the state colour — which
+/// does change — is applied on top of it in [`make_icon`].
+fn whale_coverage() -> &'static [f32] {
+    static COVERAGE: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
+    COVERAGE.get_or_init(|| rasterise(ICON_SIZE))
+}
+
+/// Supersampled point-in-polygon fill.
+///
+/// Doing this at runtime keeps the tray in step with `assets/deepseek.svg`
+/// without a build-time rasteriser or a committed PNG that could go stale.
+fn rasterise(size: u32) -> Vec<f32> {
     let polygons = whale_polygons();
-    let mut mask = vec![false; (size * size) as usize];
     let scale = size as f32 / 50.0; // The SVG viewBox is 50x50.
+    let step = 1.0 / SUPERSAMPLE as f32;
+    let per_pixel = (SUPERSAMPLE * SUPERSAMPLE) as f32;
+    let mut coverage = vec![0.0f32; (size * size) as usize];
+
     for y in 0..size {
         for x in 0..size {
-            // Sample at pixel centres.
-            let px = (x as f32 + 0.5) / scale;
-            let py = (y as f32 + 0.5) / scale;
-            if polygons.iter().any(|poly| point_in_polygon(px, py, poly)) {
-                mask[(y * size + x) as usize] = true;
+            let mut hits = 0.0;
+            for sy in 0..SUPERSAMPLE {
+                for sx in 0..SUPERSAMPLE {
+                    let px = (x as f32 + (sx as f32 + 0.5) * step) / scale;
+                    let py = (y as f32 + (sy as f32 + 0.5) * step) / scale;
+                    if polygons.iter().any(|poly| point_in_polygon(px, py, poly)) {
+                        hits += 1.0;
+                    }
+                }
             }
+            coverage[(y * size + x) as usize] = hits / per_pixel;
         }
     }
-    mask
+    coverage
 }
 
 /// The whale outline, as flattened polygons.
@@ -228,8 +256,9 @@ fn whale_polygons() -> Vec<Vec<(f32, f32)>> {
 
 /// Number of segments per cubic curve.
 ///
-/// At a 22px tray icon one SVG unit is well under a pixel, so 12 segments per
-/// curve is comfortably past the point where more would be visible.
+/// At [`ICON_SIZE`] one SVG unit is under a pixel, so 12 segments per curve is
+/// comfortably past the point where more would be visible — which matters,
+/// because the coverage mask is computed once and reused for every state.
 const CURVE_SEGMENTS: usize = 12;
 
 /// Flatten an SVG path of absolute `M`/`L`/`C`/`Z` commands into polygons.
@@ -444,18 +473,50 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn the_icon_has_retina_pixels_to_spare() {
+        // tray-icon fits the image to 18 points, so a bitmap smaller than 36
+        // pixels is upscaled and looks soft. This is the regression that made
+        // the tray look blocky, so it is worth failing loudly over.
+        assert!(
+            ICON_SIZE >= 36,
+            "tray glyph is rasterised at {ICON_SIZE}px; 18 points needs at least 36 at 2x"
+        );
+    }
+
+    #[test]
+    fn the_edges_are_antialiased() {
+        let coverage = whale_coverage();
+        let partial = coverage.iter().filter(|v| **v > 0.02 && **v < 0.98).count();
+        // A hard inside/outside test yields only 0.0 and 1.0. Real partial
+        // coverage is the whole point of supersampling.
+        assert!(
+            partial > 20,
+            "only {partial} partially covered pixels; the silhouette is not antialiased"
+        );
+    }
+
+    #[test]
+    fn the_coverage_mask_is_reused() {
+        // The mask is computed once and tinted per state; re-rasterising on
+        // every agent status change would be wasted work.
+        let first = whale_coverage();
+        let second = whale_coverage();
+        assert!(std::ptr::eq(first, second), "coverage was rasterised more than once");
+    }
+
     fn the_whale_actually_covers_pixels() {
         // Guards the whole rasterisation chain: if the fill or the winding were
         // wrong, the mask would come back empty and the tray would show nothing.
-        let mask = whale_mask(22);
-        let filled = mask.iter().filter(|v| **v).count();
-        let total = mask.len();
-        assert!(filled > 0, "whale rendered as empty");
+        let coverage = whale_coverage();
+        let solid = coverage.iter().filter(|v| **v > 0.95).count();
+        let total = coverage.len();
+        assert!(solid > 0, "whale rendered as empty");
         // A whale is a solid silhouette: expect a meaningful fraction filled,
         // but not the entire square.
         assert!(
-            filled > total / 20 && filled < total * 9 / 10,
-            "implausible coverage: {filled}/{total}"
+            solid > total / 20 && solid < total * 9 / 10,
+            "implausible coverage: {solid}/{total}"
         );
     }
 
