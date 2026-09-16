@@ -162,8 +162,14 @@ impl Tray {
             return;
         }
         self.badge = label;
+        // An empty string, not `None`. `tray-icon` 0.25's macOS `set_title`
+        // reads `if let Some(title) = title` and does nothing otherwise, so
+        // `None` sets no title and clears none either: passing it leaves the
+        // number stranded beside the icon after the count has gone back to
+        // zero. An empty title is what actually removes it.
+        //
         // `set_title` returns `()`, so there is no failure to swallow here.
-        self._icon.set_title(self.badge.as_deref());
+        self._icon.set_title(Some(self.badge.as_deref().unwrap_or("")));
     }
 
     /// Recompute the tray text from the agent state and any plugin label.
@@ -743,7 +749,9 @@ pub fn prepare_notifications() {
     {
         use block2::RcBlock;
         use objc2::runtime::Bool;
-        use objc2_user_notifications::{UNAuthorizationOptions, UNUserNotificationCenter};
+        use objc2_user_notifications::{
+            UNAuthorizationOptions, UNNotificationSettings, UNUserNotificationCenter,
+        };
 
         // See `has_app_bundle`: the centre cannot be asked for without one, and
         // the failure mode is an abort rather than an error.
@@ -753,6 +761,22 @@ pub fn prepare_notifications() {
         }
 
         let center = UNUserNotificationCenter::currentNotificationCenter();
+
+        // The answer decides whether a badge can ever appear, and the system
+        // reports it nowhere a user would look. Logged once per launch.
+        let described = RcBlock::new(|settings: std::ptr::NonNull<UNNotificationSettings>| {
+            // SAFETY: the framework passes a valid settings object for the
+            // duration of the callback.
+            let settings = unsafe { settings.as_ref() };
+            tracing::info!(
+                badge = ?settings.badgeSetting(),
+                alert = ?settings.alertSetting(),
+                sound = ?settings.soundSetting(),
+                "notification authorization"
+            );
+        });
+        center.getNotificationSettingsWithCompletionHandler(&described);
+
         let answered: RcBlock<dyn Fn(Bool, *mut objc2_foundation::NSError)> =
             RcBlock::new(|granted: Bool, err: *mut objc2_foundation::NSError| {
                 if !err.is_null() {
@@ -771,8 +795,13 @@ pub fn prepare_notifications() {
                     tracing::debug!("notifications authorized");
                 }
             });
+        // `Badge` is a separate authorization option, and the Dock badge is what
+        // it governs. Asking for only alert and sound — which is what this did
+        // first — leaves the badge permission denied, and a denied badge is
+        // silent: `setBadgeCount:` reports the refusal on a callback nobody was
+        // reading, and the icon simply stays plain.
         center.requestAuthorizationWithOptions_completionHandler(
-            UNAuthorizationOptions::Alert | UNAuthorizationOptions::Sound,
+            UNAuthorizationOptions::Alert | UNAuthorizationOptions::Sound | UNAuthorizationOptions::Badge,
             &answered,
         );
     }
@@ -780,10 +809,18 @@ pub fn prepare_notifications() {
 
 /// Show, change, or clear the Dock badge.
 ///
-/// `None` clears it. A numeric badge is passed through as digits rather than
-/// drawn here, so the Dock keeps its own styling, sizing and accessibility.
-/// Saturates rather than growing without bound: past a point the exact count
-/// stops being useful and the pill starts crowding the icon.
+/// `None` clears it.
+///
+/// **macOS 13 and later own the badge through UserNotifications.** Apple's
+/// `UNUserNotificationCenter.h` declares `setBadgeCount:withCompletionHandler:`
+/// as `API_AVAILABLE(macos(13.0))`, and `UNNotificationContent.h` documents the
+/// badge number alongside it. The older `NSDockTile.badgeLabel` still exists,
+/// and is used on the macOS 11 and 12 this app also supports, but it is not what
+/// decides whether a badge appears on a current system: the badge is gated on
+/// the `UNAuthorizationOptionBadge` authorization, which is why the count is set
+/// here rather than by drawing on the tile. A refused badge is invisible —
+/// `setBadgeCount:` reports it on a callback nothing was reading — so the
+/// failure is logged.
 ///
 /// A no-op where the platform has no Dock.
 pub fn set_dock_badge(window: &tao::window::Window, count: Option<usize>) {
@@ -791,42 +828,34 @@ pub fn set_dock_badge(window: &tao::window::Window, count: Option<usize>) {
 
     #[cfg(target_os = "macos")]
     {
-        use objc2::rc::Retained;
-        use objc2_app_kit::NSApplication;
-        use objc2_foundation::MainThreadMarker;
+        use block2::RcBlock;
+        use objc2::runtime::NSObjectProtocol;
+        use objc2::sel;
+        use objc2_user_notifications::UNUserNotificationCenter;
         use tao::platform::macos::WindowExtMacOS;
 
-        // The badge is set through tao's own platform API. tao is the layer that
-        // owns the application object — it creates `NSApp`, as a subclass of its
-        // own — and its implementation addresses that shared instance.
-        //
-        // Reaching past it to `[NSApplication sharedApplication]` compiled, ran
-        // on the main thread, reported no error, and changed nothing on screen:
-        // the Dock is a separate process, and only the instance the app was
-        // registered with can talk to it. That is also why this is not merely
-        // tidier — it is the difference between a badge and none.
-        window.set_badge_label(label);
-
-        // AppKit is main-thread-only. Every caller runs on the event loop, so
-        // this is a guard rather than a real possibility.
-        let Some(mtm) = MainThreadMarker::new() else {
-            tracing::warn!("dock badge skipped: not on the main thread");
-            return;
-        };
-
-        let tile = NSApplication::sharedApplication(mtm).dockTile();
-        if Retained::as_ptr(&tile).cast::<()>().is_null() {
-            // Worth saying out loud. A missing tile makes `setBadgeLabel:` a
-            // no-op on a nil receiver, and nothing in the system reports that:
-            // the call succeeds and the badge simply never appears.
-            tracing::warn!("this process has no dock tile; the badge cannot be shown");
-            return;
+        if has_app_bundle() {
+            let center = UNUserNotificationCenter::currentNotificationCenter();
+            if center.respondsToSelector(sel!(setBadgeCount:withCompletionHandler:)) {
+                // 0 hides the badge; `NSInteger` is `isize` on every platform
+                // this crate builds for.
+                let value = count.map(|n| n as isize).unwrap_or(0);
+                let done = RcBlock::new(|err: *mut objc2_foundation::NSError| {
+                    if !err.is_null() {
+                        tracing::warn!(
+                            error = %describe_ns_error(err),
+                            "the system refused the dock badge; check \
+                             System Settings > Notifications > Badges"
+                        );
+                    }
+                });
+                center.setBadgeCount_withCompletionHandler(value, Some(&done));
+                return;
+            }
         }
-        // Redraw explicitly. A badge set on a freshly launched app appears on
-        // its own, but one set from a long-running app has been observed not to
-        // reach the screen. Forcing the redraw costs nothing when it was going
-        // to happen anyway.
-        tile.display();
+
+        // macOS 11 and 12, where the dock tile is the only badge there is.
+        window.set_badge_label(label);
     }
 
     #[cfg(not(target_os = "macos"))]

@@ -216,5 +216,16 @@ if [[ "$INSTALL" == "1" ]]; then
   echo "==> installing to /Applications"
   rm -rf "/Applications/${APP_NAME}.app"
   cp -R "$DIST" "/Applications/${APP_NAME}.app"
+
+  # LaunchServices keys its records by bundle id, so leaving the staging copy in
+  # place registers one id against two paths; several such copies (including
+  # deleted and Trash-ed ones) were found registered at once. Installing is the
+  # moment the real bundle takes over, so the staging copy is unregistered.
+  # `lsregister -kill` no longer exists on macOS 26; `-u` still does.
+  LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+  if [[ -x "$LSREGISTER" ]]; then
+    "$LSREGISTER" -u "$(cd "$DIST" && pwd)" >/dev/null 2>&1 || true
+  fi
+
   echo "installed. launch with: open -a \"${APP_NAME}\""
 fi

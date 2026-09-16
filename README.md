@@ -542,37 +542,80 @@ Two things it is worth reading it for, because both are otherwise invisible:
 
 ### Debugging the badges
 
-- **`NSDockTile.setBadgeLabel` does work here — it is the shell's call to it that
-  did not.** Minimal probe apps (a Cocoa window that sets a label, with and
-  without a menu-bar status item, at launch and later from the background) all
-  render a badge on this machine, including in the same frame in which the
-  shell's own Dock icon showed none while its log said the badge had been
-  requested. What the shell does differently now is use the platform's own path:
-  the label goes through tao's `WindowExtMacOS::set_badge_label`, and the tile is
-  then redrawn explicitly. With that change a bundled, LaunchServices-launched
-  build of the shell renders the badge, which is how it was verified.
+- **The Dock badge is governed by notification authorization, not by
+  `NSDockTile`.** `UNAuthorizationOptions` carries `UNAuthorizationOptionBadge`
+  as its own option (`UNUserNotificationCenter.h`), and macOS 13 added
+  `setBadgeCount:withCompletionHandler:` (`API_AVAILABLE(macos(13.0))`). This
+  app originally requested only `Alert | Sound`, so badge authorization was
+  never granted and *`NSDockTile.badgeLabel` did nothing at all* — silently.
+  The system reports the state, and the log prints it once per launch:
+
+  ```
+  INFO dsh_shell::native: notification authorization badge=UNNotificationSetting(0)
+       alert=UNNotificationSetting(2) sound=UNNotificationSetting(2)
+  ```
+
+  `0` is not-supported, `2` is enabled. Badge was `0` throughout the whole
+  investigation; alert and sound were already `2`, which is exactly why
+  notifications and the menu-bar number worked while the Dock stayed plain.
+  The shell now requests `Badge` too and sets the count through
+  `setBadgeCount:`, which also reports a refusal on its completion handler —
+  a refused badge is otherwise indistinguishable from one that never happened.
+  macOS 11 and 12 keep the `NSDockTile` path, chosen at runtime with
+  `respondsToSelector:`.
+- **The tray number and the Dock badge are separate mechanisms.** The tray is
+  plain AppKit text on a status item and needs no permission; the Dock is
+  UserNotifications and does. One working while the other does not is the
+  expected shape of a missing badge authorization, not a bug in either.
+- **`tray-icon` 0.25 cannot clear a title with `None`.** Its macOS
+  `set_title_inner` reads `if let Some(title) = title` and does nothing
+  otherwise, so `set_title(None)` is a silent no-op: the number stays beside the
+  icon after the count returns to zero. Pass `Some("")` instead. This is why the
+  tray count did not disappear when the window came back in front, while the
+  Dock badge did.
 - **Do not infer "is the user looking at the app" from tao's `Focused` events.**
   The tracked flag is initialised to `true` — an assumption that the window was
   focused when it opened — and only moves when a transition is actually
   delivered. A LaunchServices-launched instance was observed logging
   `tracked_focus=true active=false` while it sat behind another app, which is
-  exactly the state in which the badge must appear and did not. It is now asked
-  of AppKit directly (`NSApplication.isActive`), which has no state to go stale.
+  exactly the state in which the badge must appear. It is now asked of AppKit
+  directly (`NSApplication.isActive`), which has no state to go stale.
 - **A process with no app bundle aborts when it touches
   `UNUserNotificationCenter`.** Not an error — an ObjC exception, which Rust
   cannot catch. `prepare_notifications` and `notify_macos` both check for a
   bundle first, which is what makes `cargo run` usable at all.
+
+### Two false leads, for whoever is next
+
+Neither of these was the cause, and both cost real time. They are recorded so
+they can be dismissed quickly rather than re-investigated.
+
+- **Duplicate LaunchServices registrations for one bundle id.** Building into
+  `dist/`, copying the bundle around, and launching those copies registers the
+  same `CFBundleIdentifier` against several paths — 7 in one case, including
+  deleted and Trash-ed copies. That is genuinely worth cleaning
+  (`lsregister -u <path>`, then `lsregister -f` the installed app; `-kill` no
+  longer exists on macOS 26), but badges still did not appear afterwards.
+  `make-app.sh` now unregisters its staging copy after installing, so the
+  hazard does not rebuild itself.
+- **Code signing.** Team-signed and ad-hoc builds were compared side by side
+  with two identical minimal apps and two copies of this one: both signings
+  badge. The signature is not a factor here.
 
 ### A note on verifying any of this
 
 **`screencapture -R` returned frozen frames here.** A region capture was taken,
 an app was launched and quit so that its Dock icon came and went, and a second
 region capture of the same rectangle was byte-identical in every pixel. Every
-conclusion drawn from diffing region captures in that window was worthless.
-Full-screen captures (`screencapture -x`) stayed live, and cropping them with
-`sips -c <h> <w> --cropOffset <top> <left>` is the method that held up. Confirm
-the tool before trusting the measurement — the same lesson as
-`defaults read com.apple.ncprefs` above.
+conclusion drawn from diffing region captures in that window was worthless, and
+several were drawn. Full-screen captures (`screencapture -x`) stayed live, and
+cropping them with `sips -c <h> <w> --cropOffset <top> <left>` is the method
+that held up. Confirm the tool before trusting the measurement — the same
+lesson as `defaults read com.apple.ncprefs` above.
+
+The other half of that lesson: a 2400-pixel-wide preview read by eye will
+happily show you a badge that is not there. Verify pixel-level claims with
+something that measures pixels.
 
 ## Licence
 
