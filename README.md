@@ -47,7 +47,8 @@ runtime it was trying to avoid in the first place.
 | **Single instance** | A second launch raises the running window instead of starting a second shell |
 | **Remembers the window** | Size, position, and zoom come back on the next launch |
 | **Dock reopen** | Clicking the dock icon restores a hidden or minimized window |
-| **Dock badge** | A red count of finished turns you have not looked at; clears when the window regains focus |
+| **Dock badge + tray count** | Finished turns you have not looked at, as a red number on the dock icon and the same number beside the menu-bar icon; clears when the window is in front again |
+| **A readable log** | Diagnostics go to `$DSH_HOME/cache/dsh-shell/dsh-shell.log`, not to a terminal a GUI app does not have |
 | **Plugin bridge** | A real DSH Host plugin forwards `agent/*` events to the shell |
 
 ## Requirements
@@ -218,11 +219,29 @@ turns them into tray state and notifications.
 | Event | Effect |
 |---|---|
 | `agent/status` | Tray colour: idle / working / failed |
-| `agent/turn-stopping` | Tray → idle, notification |
+| `agent/turn-stopping` | Tray → idle, notification, dock + tray count |
 | `agent/request-error` | Tray → failed, notification with the message |
 
 The shell works identically without the plugin: the bridge is optional by design,
 and the plugin cannot break the host.
+
+That last claim is a property to maintain, not an accident, and two ways of
+losing it are worth knowing:
+
+- **A listener on a cordis `waterfall` must call `next()`.** `agent/request-error`
+  is a waterfall and `dsh-llm-retry` is a listener on it; a listener that returns
+  without forwarding "vetoes the rest of the chain, including the built-in
+  behavior", which silently disables retries for the whole host. Observing must
+  never change what is observed.
+- **Agent events carry `payload.agent`, not a `sessionId`.** Every agent-subject
+  event is dispatched through a fused carrier that injects the subject, so the
+  identity is `agent.id` and a top-level `sessionId` is always `undefined`. That
+  mistake does not break anything — the notification still appears — which is
+  exactly why it went unnoticed: it only means the shell cannot name the session.
+  `agent/request-error` likewise nests its text under `failure.message`.
+
+The payload shape is pinned by tests against the emit sites, so guessing at a
+field fails the suite rather than quietly degrading a notification.
 
 ## Architecture
 
@@ -488,12 +507,72 @@ A note for whoever looks at this next, because it cost a long detour:
 - **The permission prompt is not instant.** It can arrive several seconds after
   launch, behind the app's own window. Concluding "no prompt appeared" too early
   is easy.
-- Failure is logged with the `NSError` on the `warn` level, so run with
-  `RUST_LOG=debug` (or watch for the warning) rather than guessing.
+- Failure is logged with the `NSError` on the `warn` level, so read the log
+  rather than guessing. See below for where it is.
 - **A shell-script launcher breaks notifications.** With a wrapper as
   `CFBundleExecutable`, `usernotificationsd` reports *"Couldn't get record to
   check entitlement key"* and refuses the request, however the bundle is signed.
   The shipped app has no wrapper, so this only bites when testing.
+
+## The log
+
+```
+$DSH_HOME/cache/dsh-shell/dsh-shell.log
+```
+
+The shell is a GUI app, so its stdout goes nowhere: launched from Finder there
+is no terminal attached, and macOS does not route a plain process's stdout into
+the unified log. Everything is therefore *also* written here, at `debug` rather
+than the terminal's `info`, and the file is truncated on each launch so it holds
+the run you are asking about rather than everything since.
+
+`DSH_SHELL_LOG` moves it, `DSH_SHELL_LOG_LEVEL` changes the filter, and
+`RUST_LOG` still governs stdout.
+
+Two things it is worth reading it for, because both are otherwise invisible:
+
+- **The host's own output.** The shell captures `dsh web`'s stdout and stderr
+  and forwards it under the `dsh` target, so the bridge plugin's
+  `[dsh-plugin-shell-bridge] connected to shell` lands in the file. Without that
+  line there is no way to tell a plugin that is not loaded from one whose
+  messages are not arriving.
+- **The badge decision.** Every finished turn logs the inputs — whether AppKit
+  says the app is active, whether the window is visible, and what the tracked
+  focus flag thought. A badge that does not appear is otherwise unarguable.
+
+### Debugging the badges
+
+- **`NSDockTile.setBadgeLabel` does work here — it is the shell's call to it that
+  did not.** Minimal probe apps (a Cocoa window that sets a label, with and
+  without a menu-bar status item, at launch and later from the background) all
+  render a badge on this machine, including in the same frame in which the
+  shell's own Dock icon showed none while its log said the badge had been
+  requested. What the shell does differently now is use the platform's own path:
+  the label goes through tao's `WindowExtMacOS::set_badge_label`, and the tile is
+  then redrawn explicitly. With that change a bundled, LaunchServices-launched
+  build of the shell renders the badge, which is how it was verified.
+- **Do not infer "is the user looking at the app" from tao's `Focused` events.**
+  The tracked flag is initialised to `true` — an assumption that the window was
+  focused when it opened — and only moves when a transition is actually
+  delivered. A LaunchServices-launched instance was observed logging
+  `tracked_focus=true active=false` while it sat behind another app, which is
+  exactly the state in which the badge must appear and did not. It is now asked
+  of AppKit directly (`NSApplication.isActive`), which has no state to go stale.
+- **A process with no app bundle aborts when it touches
+  `UNUserNotificationCenter`.** Not an error — an ObjC exception, which Rust
+  cannot catch. `prepare_notifications` and `notify_macos` both check for a
+  bundle first, which is what makes `cargo run` usable at all.
+
+### A note on verifying any of this
+
+**`screencapture -R` returned frozen frames here.** A region capture was taken,
+an app was launched and quit so that its Dock icon came and went, and a second
+region capture of the same rectangle was byte-identical in every pixel. Every
+conclusion drawn from diffing region captures in that window was worthless.
+Full-screen captures (`screencapture -x`) stayed live, and cropping them with
+`sips -c <h> <w> --cropOffset <top> <left>` is the method that held up. Confirm
+the tool before trusting the measurement — the same lesson as
+`defaults read com.apple.ncprefs` above.
 
 ## Licence
 

@@ -13,6 +13,7 @@
 mod bridge;
 mod i18n;
 mod instance;
+mod logfile;
 mod menu;
 mod native;
 mod runtime;
@@ -71,13 +72,76 @@ const READY_MESSAGE: &str = "dsh-shell:drag-ready";
 /// into hundreds of writes.
 const GEOMETRY_WRITE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
-fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+/// Install the diagnostics sinks.
+///
+/// Two of them, deliberately filtered differently:
+///
+///  * stdout, at `info`, for whoever launched the shell from a terminal;
+///  * a file under DSH's home, at `debug`, for everyone else.
+///
+/// The file is the one that matters in practice. A Finder-launched app has no
+/// terminal, so its stdout is discarded — which is how "the badge never
+/// appears" stayed unexplained: the shell was recording exactly the answer and
+/// nobody could read it. Keeping the file chattier than the terminal is the
+/// point, not an oversight.
+fn init_tracing() {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::EnvFilter;
+    // For `Layer::with_filter`, which is how each sink gets its own level.
+    use tracing_subscriber::Layer;
+
+    // `RUST_LOG` keeps working for a terminal run.
+    let stdout_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+
+    let registry = tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_filter(stdout_filter));
+
+    let Some(path) = logfile::path() else {
+        registry.init();
+        return;
+    };
+    let Some(file) = logfile::open(&path) else {
+        registry.init();
+        return;
+    };
+
+    // `dsh` is the target the host's captured stdout is logged under, so a
+    // plugin's own `console.log` lands in the file too.
+    let file_filter = std::env::var("DSH_SHELL_LOG_LEVEL")
+        .ok()
+        .and_then(|level| EnvFilter::try_new(level).ok())
+        .unwrap_or_else(|| EnvFilter::new("info,dsh_shell=debug,dsh=debug"));
+
+    registry
+        .with(
+            tracing_subscriber::fmt::layer()
+                // Escape sequences would be noise in a file nobody pages with.
+                .with_ansi(false)
+                .with_writer(std::sync::Mutex::new(file))
+                .with_filter(file_filter),
         )
         .init();
+
+    tracing::info!(log = %path.display(), "diagnostics are being written to this file");
+}
+
+/// Show the unread-turn count everywhere it appears.
+///
+/// The Dock tile and the menu bar carry the same fact, so they are always
+/// written together. Setting one and not the other reads as a bug, and leaves
+/// the user unable to tell which of the two is stale. A count of zero clears
+/// both, so "clear" has exactly one spelling.
+fn apply_unseen(window: &tao::window::Window, tray: &mut Option<native::Tray>, unseen: usize) {
+    native::set_dock_badge(window, Some(unseen));
+    if let Some(active) = tray.as_mut() {
+        active.set_badge(Some(unseen));
+    }
+}
+
+fn main() {
+    init_tracing();
 
     // One shell per user session, claimed before anything else is started.
     //
@@ -342,11 +406,16 @@ fn main() {
     // the system remembers the answer.
     let mut asked_for_notifications = false;
 
-    // Finished turns the user has not looked at yet, shown as a Dock badge.
-    // The window is focused when it opens, so this starts settled rather than
-    // showing a badge for work nobody has missed.
+    // Finished turns the user has not looked at yet, shown as a Dock badge and
+    // as a number beside the tray icon.
+    //
+    // The window is assumed to open in front, so this starts settled rather
+    // than badging work nobody has missed. `was_watched` is the same assumption
+    // for the other direction: it is what "the user came back" is measured
+    // against.
     let mut unseen: usize = 0;
     let mut window_focused = true;
+    let mut was_watched = true;
 
     let mut last_geometry = restored;
     let mut geometry_dirty = false;
@@ -681,13 +750,31 @@ fn main() {
                 // needs no badge; one that finishes behind something else does.
                 // The notification is posted either way — it is what carries
                 // *what* happened, and it is what the user asked to be told.
-                // Hiding to the tray does not reliably deliver a focus-lost
-                // event, so visibility is checked too — a hidden window is
-                // never being watched.
-                if !window_focused || !window.is_visible() {
+                //
+                // "Looking at it" is asked of AppKit rather than read from the
+                // tracked focus flag: that flag starts as an assumption and only
+                // moves when tao delivers a focus transition, so a window that
+                // is never made key leaves it stuck at `true` and the badge
+                // never appears. See `native::app_is_active`.
+                //
+                // The decision and its inputs are logged: whether a badge
+                // appears depends on state the user cannot see, which makes
+                // "nothing happened" impossible to act on otherwise.
+                let visible = window.is_visible();
+                let active = native::app_is_active().unwrap_or(window_focused);
+                let watched = active && visible;
+                if !watched {
                     unseen += 1;
-                    native::set_dock_badge(Some(unseen));
+                    apply_unseen(&window, &mut tray, unseen);
                 }
+                tracing::info!(
+                    unseen,
+                    active,
+                    visible,
+                    watched,
+                    tracked_focus = window_focused,
+                    "a turn finished"
+                );
             }
         }
 
@@ -774,18 +861,15 @@ fn main() {
             } => {
                 geometry_dirty = true;
             }
-            // Looking at the window is what "seen" means, so the badge clears
-            // here rather than on a timer or on any particular click.
+            // Kept for the fallback and for the logged comparison: the badge
+            // decision itself asks AppKit, because this event is not a reliable
+            // answer to "is the user looking" (see below).
             Event::WindowEvent {
                 event: WindowEvent::Focused(focused),
                 ..
             } => {
                 window_focused = focused;
-                if focused && unseen > 0 {
-                    unseen = 0;
-                    native::set_dock_badge(None);
-                    tracing::debug!("dock badge cleared on focus");
-                }
+                tracing::debug!(focused, "tao reported a focus change");
             }
             // macOS only. Clicking the dock icon while the window is hidden must
             // bring it back: the window hides to the tray on close, so without
@@ -797,6 +881,27 @@ fn main() {
                 tracing::info!("reopened from the dock");
             }
             _ => {}
+        }
+
+        // Looking at the window is what "seen" means, so the badges clear as
+        // soon as the app is in front again — whatever brought it back: a
+        // click, the Dock, the summon shortcut, or the tray menu.
+        //
+        // Evaluated here, on the loop's own tick, rather than in a focus-event
+        // handler. A window that AppKit never made key produces no focus
+        // transitions at all, so a listener-based clear would leave the badge
+        // stuck on just as the setter would leave it stuck off. Asking AppKit
+        // each tick costs a property read and always has an answer.
+        {
+            let visible = window.is_visible();
+            let active = native::app_is_active().unwrap_or(window_focused);
+            let watched = active && visible;
+            if watched && !was_watched && unseen > 0 {
+                unseen = 0;
+                apply_unseen(&window, &mut tray, unseen);
+                tracing::debug!(active, visible, "unread badges cleared; the window is in front");
+            }
+            was_watched = watched;
         }
 
         // Persist the geometry, but not on every frame of a drag.

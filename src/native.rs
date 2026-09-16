@@ -70,6 +70,8 @@ pub struct Tray {
     pub state: AgentState,
     /// A short label contributed by a plugin, shown after the agent state.
     plugin_label: Option<String>,
+    /// The unread count shown beside the icon, already formatted.
+    badge: Option<String>,
     locale: crate::i18n::Locale,
 }
 
@@ -115,6 +117,7 @@ impl Tray {
             quit_item,
             state: AgentState::Idle,
             plugin_label: None,
+            badge: None,
             locale,
         })
     }
@@ -143,7 +146,27 @@ impl Tray {
         self.refresh_label();
     }
 
-/// Recompute the tray text from the agent state and any plugin label.
+    /// Show, change, or clear the unread count beside the icon.
+    ///
+    /// The count is drawn as the status item's own title rather than baked into
+    /// the icon. On macOS that is the platform's mechanism for text next to a
+    /// menu-bar image: the system places it, sizes it, tints it for the light
+    /// and dark menu bar, and keeps it out of the way of the notch. It is also
+    /// the only form that stays legible at menu-bar scale, where a red pill
+    /// with a digit inside would be a few pixels wide.
+    ///
+    /// A count of zero clears it; see [`badge_label`].
+    pub fn set_badge(&mut self, count: Option<usize>) {
+        let label = badge_label(count);
+        if self.badge == label {
+            return;
+        }
+        self.badge = label;
+        // `set_title` returns `()`, so there is no failure to swallow here.
+        self._icon.set_title(self.badge.as_deref());
+    }
+
+    /// Recompute the tray text from the agent state and any plugin label.
     fn refresh_label(&mut self) {
         let t = self.locale.strings();
         let state = self.state.label(self.locale);
@@ -475,19 +498,19 @@ mod tests {
     #[test]
     #[test]
     fn no_badge_is_shown_for_nothing_to_report() {
-        assert_eq!(dock_badge_label(None), None);
-        assert_eq!(dock_badge_label(Some(0)), None);
+        assert_eq!(badge_label(None), None);
+        assert_eq!(badge_label(Some(0)), None);
     }
 
     #[test]
     fn the_badge_counts_up_to_a_cap() {
-        assert_eq!(dock_badge_label(Some(1)).as_deref(), Some("1"));
-        assert_eq!(dock_badge_label(Some(42)).as_deref(), Some("42"));
-        assert_eq!(dock_badge_label(Some(99)).as_deref(), Some("99"));
+        assert_eq!(badge_label(Some(1)).as_deref(), Some("1"));
+        assert_eq!(badge_label(Some(42)).as_deref(), Some("42"));
+        assert_eq!(badge_label(Some(99)).as_deref(), Some("99"));
         // Beyond the cap the exact number stops being useful and the pill
         // would start crowding the icon.
-        assert_eq!(dock_badge_label(Some(100)).as_deref(), Some("99+"));
-        assert_eq!(dock_badge_label(Some(9999)).as_deref(), Some("99+"));
+        assert_eq!(badge_label(Some(100)).as_deref(), Some("99+"));
+        assert_eq!(badge_label(Some(9999)).as_deref(), Some("99+"));
     }
 
     #[test]
@@ -677,6 +700,35 @@ fn describe_ns_error(err: *mut objc2_foundation::NSError) -> String {
     )
 }
 
+/// Whether the user is looking at this app, or `None` where the platform cannot
+/// answer and the caller must fall back to its own tracking.
+///
+/// The badge rule is "only when the window is not in front of the user", and
+/// this is what makes that question answerable. Inferring it from tao's
+/// `Focused` events is what silently broke the badge: the tracked flag starts
+/// at `true` — an assumption that the window was focused when it opened — and
+/// it only ever changes when a focus transition is actually delivered. If the
+/// window is never made key, no transition is delivered, and the flag stays at
+/// that initial guess forever. The badge then never appears, in exactly the
+/// situation it exists for, with nothing to indicate why.
+///
+/// Asking AppKit directly has no such state to go stale: it answers for the
+/// moment the question is asked.
+pub fn app_is_active() -> Option<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        use objc2_app_kit::NSApplication;
+        use objc2_foundation::MainThreadMarker;
+
+        // AppKit is main-thread-only; every caller runs on the event loop.
+        let mtm = MainThreadMarker::new()?;
+        return Some(NSApplication::sharedApplication(mtm).isActive());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    None
+}
+
 /// Ask the system for permission to notify, once, at startup.
 ///
 /// `UNUserNotificationCenter` delivers nothing until the user has allowed it,
@@ -692,6 +744,13 @@ pub fn prepare_notifications() {
         use block2::RcBlock;
         use objc2::runtime::Bool;
         use objc2_user_notifications::{UNAuthorizationOptions, UNUserNotificationCenter};
+
+        // See `has_app_bundle`: the centre cannot be asked for without one, and
+        // the failure mode is an abort rather than an error.
+        if !has_app_bundle() {
+            tracing::info!("no app bundle; notifications are unavailable and were not requested");
+            return;
+        }
 
         let center = UNUserNotificationCenter::currentNotificationCenter();
         let answered: RcBlock<dyn Fn(Bool, *mut objc2_foundation::NSError)> =
@@ -727,34 +786,61 @@ pub fn prepare_notifications() {
 /// stops being useful and the pill starts crowding the icon.
 ///
 /// A no-op where the platform has no Dock.
-pub fn set_dock_badge(count: Option<usize>) {
-    let label = dock_badge_label(count);
+pub fn set_dock_badge(window: &tao::window::Window, count: Option<usize>) {
+    let label = badge_label(count);
 
     #[cfg(target_os = "macos")]
     {
+        use objc2::rc::Retained;
         use objc2_app_kit::NSApplication;
-        use objc2_foundation::{MainThreadMarker, NSString};
+        use objc2_foundation::MainThreadMarker;
+        use tao::platform::macos::WindowExtMacOS;
+
+        // The badge is set through tao's own platform API. tao is the layer that
+        // owns the application object — it creates `NSApp`, as a subclass of its
+        // own — and its implementation addresses that shared instance.
+        //
+        // Reaching past it to `[NSApplication sharedApplication]` compiled, ran
+        // on the main thread, reported no error, and changed nothing on screen:
+        // the Dock is a separate process, and only the instance the app was
+        // registered with can talk to it. That is also why this is not merely
+        // tidier — it is the difference between a badge and none.
+        window.set_badge_label(label);
 
         // AppKit is main-thread-only. Every caller runs on the event loop, so
         // this is a guard rather than a real possibility.
         let Some(mtm) = MainThreadMarker::new() else {
-            tracing::debug!("dock badge skipped: not on the main thread");
+            tracing::warn!("dock badge skipped: not on the main thread");
             return;
         };
-        let label = label.as_deref().map(NSString::from_str);
-        NSApplication::sharedApplication(mtm)
-            .dockTile()
-            .setBadgeLabel(label.as_deref());
+
+        let tile = NSApplication::sharedApplication(mtm).dockTile();
+        if Retained::as_ptr(&tile).cast::<()>().is_null() {
+            // Worth saying out loud. A missing tile makes `setBadgeLabel:` a
+            // no-op on a nil receiver, and nothing in the system reports that:
+            // the call succeeds and the badge simply never appears.
+            tracing::warn!("this process has no dock tile; the badge cannot be shown");
+            return;
+        }
+        // Redraw explicitly. A badge set on a freshly launched app appears on
+        // its own, but one set from a long-running app has been observed not to
+        // reach the screen. Forcing the redraw costs nothing when it was going
+        // to happen anyway.
+        tile.display();
     }
 
     #[cfg(not(target_os = "macos"))]
-    let _ = label;
+    let _ = (window, label);
 }
 
-/// The badge text for a count, or `None` to leave the Dock unbadged.
+/// The badge text for a count, or `None` to leave the icon unbadged.
 ///
-/// Split out from the AppKit call so the rule can be tested without a Dock.
-fn dock_badge_label(count: Option<usize>) -> Option<String> {
+/// One rule shared by the Dock tile and the tray icon, because they show the
+/// same fact in two places: two implementations would eventually saturate at
+/// different numbers, or disagree about whether zero means "nothing".
+///
+/// Split out from the platform calls so the rule can be tested without a Dock.
+pub(crate) fn badge_label(count: Option<usize>) -> Option<String> {
     /// Past this the exact number stops being useful and the pill starts
     /// crowding the icon.
     const MAX_SHOWN: usize = 99;
@@ -793,6 +879,24 @@ pub fn notify(locale: crate::i18n::Locale, summary: &str, body: &str) {
     }
 }
 
+/// Whether this process has an app bundle.
+///
+/// `UNUserNotificationCenter` is keyed by bundle identity, and asking it for the
+/// current centre in a process that has none does not return an error: it raises
+/// an ObjC exception, which unwinds through Rust and aborts the process. Both
+/// notification entry points therefore ask this first, because there is nothing
+/// to catch afterwards.
+///
+/// The bare binary has no bundle — which is what `cargo run` and a release build
+/// launched straight from a terminal both produce — so without this, a developer
+/// run dies the moment the first turn finishes.
+#[cfg(target_os = "macos")]
+fn has_app_bundle() -> bool {
+    objc2_foundation::NSBundle::mainBundle()
+        .bundleIdentifier()
+        .is_some()
+}
+
 /// Deliver one notification through `UNUserNotificationCenter`.
 ///
 /// The identifier only has to be unique among *pending* requests. A nil trigger
@@ -806,6 +910,10 @@ fn notify_macos(summary: &str, body: &str) -> Result<(), String> {
         UNMutableNotificationContent, UNNotificationRequest, UNUserNotificationCenter,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    if !has_app_bundle() {
+        return Err("no app bundle; notifications are unavailable".into());
+    }
 
     static NEXT_ID: AtomicU64 = AtomicU64::new(0);
     let id = format!(

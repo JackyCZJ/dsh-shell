@@ -56,28 +56,70 @@ export function socketPath(env = process.env) {
 }
 
 /**
+ * The session id an agent event carries.
+ *
+ * Every agent-subject event is dispatched through a fused carrier that injects
+ * the subject, so the payload holds `agent` and the identity is `agent.id`
+ * (`Agent` is `{ id: SessionId }`). There is no top-level `sessionId` on any of
+ * them: reading one yields `undefined` for every event, which still produces a
+ * working notification and therefore hides the mistake — the shell just cannot
+ * say *which* session finished.
+ *
+ * @param {unknown} payload - the dispatched payload.
+ * @returns {string | undefined} the session id, when the payload has one.
+ */
+function sessionIdOf(payload) {
+  const id = payload?.agent?.id
+  return typeof id === 'string' ? id : undefined
+}
+
+/**
+ * The text of a failed request.
+ *
+ * `agent/request-error` reports an `LlmFailure` under `failure`; the other two
+ * spellings are accepted so a payload that grows one still reads. Errors are
+ * the one place free text is genuinely worth forwarding: it is the difference
+ * between "the request failed" and *why*.
+ *
+ * @param {unknown} payload - the dispatched payload.
+ * @returns {string | undefined} one flattened line, trimmed to fit a banner.
+ */
+function failureMessage(payload) {
+  return truncate(
+    payload?.failure?.message ?? payload?.error?.message ?? payload?.message,
+    300,
+  )
+}
+
+/**
  * Strip a session event down to what the shell needs.
  *
  * The shell renders notifications and a tray state; it has no business holding
  * full prompts or model output. Trimming here also keeps the socket cheap.
+ *
+ * Exported so the wire shape can be pinned against the payloads DSH actually
+ * dispatches, which is what caught the invented `sessionId` above.
+ *
+ * @param {string} kind - the shell-facing event kind.
+ * @param {any} payload - the payload DSH dispatched.
+ * @returns {object} the trimmed event, ready to serialise.
  */
-function summarize(kind, payload) {
+export function summarize(kind, payload) {
+  const sessionId = sessionIdOf(payload)
   switch (kind) {
     case 'status':
-      return { kind, status: payload?.status ?? payload?.state ?? 'unknown' }
+      // `status` is the spelling the agent loop uses; `state` is tolerated.
+      return { kind, sessionId, status: payload?.status ?? payload?.state ?? 'unknown' }
     case 'turn-stopping':
-      return { kind, sessionId: payload?.sessionId, reason: payload?.reason }
+      // A turn that stops normally carries no reason, and the shell's own
+      // "done" wording is the right body for it. `reason` is still read so the
+      // shell's "stopped: …" path lights up if DSH ever starts sending one.
+      return { kind, sessionId, reason: truncate(payload?.reason, 300) }
     case 'request-error':
-      return {
-        kind,
-        sessionId: payload?.sessionId,
-        // Errors are the one place free text is genuinely useful to a user.
-        message: truncate(payload?.error?.message ?? payload?.message, 300),
-      }
+      return { kind, sessionId, message: failureMessage(payload) }
     case 'created':
-      return { kind, sessionId: payload?.sessionId }
     case 'disposed':
-      return { kind, sessionId: payload?.sessionId }
+      return { kind, sessionId }
     default:
       return { kind }
   }
@@ -666,12 +708,24 @@ export function apply(ctx) {
   ]) {
     // Listener failures are isolated here rather than relying on the host to
     // catch them, so a bug in this plugin can never fail an agent turn.
-    ctx.on(event, (payload) => {
+    //
+    // The `next` parameter is load-bearing, and only for `agent/request-error`:
+    // that one is dispatched as a cordis *waterfall*, where "a listener that
+    // does not call `next()` vetoes the rest of the chain, including the
+    // built-in behavior". `dsh-llm-retry` is a listener on exactly that chain,
+    // and it is what turns a transient provider failure into a retry instead of
+    // a failed turn — so an observer that returns without forwarding would
+    // silently disable retries. Observing must never change what is observed.
+    //
+    // The parameter is simply absent for the plain notifications, where there
+    // is no chain to continue.
+    ctx.on(event, (payload, next) => {
       try {
         link.send({ ...summarize(kind, payload), at: Date.now() })
       } catch (error) {
         log.debug?.(`[shell-bridge] dropped ${kind}: ${error?.message ?? error}`)
       }
+      return typeof next === 'function' ? next() : undefined
     })
   }
 
