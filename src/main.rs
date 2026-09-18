@@ -20,6 +20,7 @@ mod runtime;
 mod server;
 mod settings;
 mod theme;
+mod updater;
 mod window_state;
 
 use std::path::PathBuf;
@@ -165,6 +166,14 @@ fn main() {
         };
 
     let dsh_program = std::env::var("DSH_BIN").unwrap_or_else(|_| "dsh".to_string());
+    // Resolved once, here, so the host the shell launches and the install an
+    // upgrade would replace cannot drift apart; a second resolution inside the
+    // server could pick a different launcher and leave the upgrade rewriting a
+    // tree nobody is running.
+    let launcher = std::path::PathBuf::from(server::resolve_launcher(&dsh_program));
+    tracing::info!(launcher = %launcher.display(), "resolved the DSH launcher");
+    // The update workers read it from here; see `launcher_for_updates`.
+    let _ = UPDATE_LAUNCHER.set(launcher.clone());
     let port: u16 = std::env::var("DSH_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
@@ -181,26 +190,7 @@ fn main() {
     // Start `dsh web` on a worker runtime so the UI thread is never blocked
     // waiting for the host to boot.
     let (url_tx, url_rx) = std::sync::mpsc::channel::<Result<server::DshServer, String>>();
-    std::thread::Builder::new()
-        .name("dsh-launch".into())
-        .spawn(move || {
-            let runtime = match tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(err) => {
-                    let _ = url_tx.send(Err(format!("tokio runtime: {err}")));
-                    return;
-                }
-            };
-            let result = runtime.block_on(server::start(dsh_program, port));
-            // The runtime must outlive the server it supervises, so leak it into
-            // a parked thread rather than dropping it here.
-            std::mem::forget(runtime);
-            let _ = url_tx.send(result);
-        })
-        .expect("spawn dsh launcher thread");
+    spawn_host(url_tx, launcher.clone(), port);
 
     // --- Native capabilities ---------------------------------------------
     //
@@ -405,6 +395,7 @@ fn main() {
     // Whether the notification permission has been asked for yet. One shot:
     // the system remembers the answer.
     let mut asked_for_notifications = false;
+    let mut asked_for_updates = false;
 
     // Finished turns the user has not looked at yet, shown as a Dock badge and
     // as a number beside the tray icon.
@@ -429,6 +420,21 @@ fn main() {
         std::sync::mpsc::channel::<(String, settings::SettingsRequest)>();
     // Save outcomes come back from the worker thread that talked to the Host.
     let (save_tx, save_rx) = std::sync::mpsc::channel::<(bool, Option<String>)>();
+
+    // --- DSH upgrades ---------------------------------------------------
+    //
+    // Detection is automatic and cached; application is always a response to a
+    // click. The status is kept here, on the UI thread, because it is rendered
+    // by the settings page and the tray.
+    let update_channel = updater::Channel::parse(&theme_source.current().update_channel)
+        .unwrap_or_default();
+    let mut update_status = updater::Status {
+        channel: update_channel,
+        ..updater::Status::default()
+    };
+    // Checks and installs run on a worker: a registry fetch and a 280 MB install
+    // must never block the UI thread.
+    let (update_tx, update_rx) = std::sync::mpsc::channel::<updater::Status>();
 
     event_loop.run(move |event, event_loop, control_flow| {
         // The Rc owns the window; `&*window` yields the `&Window` the APIs want.
@@ -484,6 +490,18 @@ fn main() {
             native::prepare_notifications();
         }
 
+        // One automatic update check per launch, off the UI thread.
+        //
+        // Not `force`, so this only reaches the network when the cached answer
+        // has aged past `CHECK_INTERVAL`; otherwise it is a file read. That is
+        // what keeps a launch from ever waiting on the registry, and it is the
+        // whole of the automatic behaviour — nothing is installed without a
+        // click, because this project publishes release candidates.
+        if !asked_for_updates {
+            asked_for_updates = true;
+            request_update_check(&update_tx, &mut update_status, false);
+        }
+
         // --- Second launch handed off to us -------------------------------
         //
         // The lock made the new launch exit; this is the other half of it. The
@@ -509,7 +527,11 @@ fn main() {
                             &theme_source,
                             &plugin_link,
                             &settings_tx,
+                            &update_status,
                         );
+                    }
+                    Some(native::TrayCommand::CheckForUpdates) => {
+                        request_update_check(&update_tx, &mut update_status, true);
                     }
                     Some(native::TrayCommand::Quit) => {
                         shutdown_server(&mut server);
@@ -570,6 +592,19 @@ fn main() {
             }
         }
 
+        // --- Update status -------------------------------------------------
+        //
+        // Arrives from the worker that checked the registry or staged an
+        // install. Stored here and pushed to the settings page and the tray
+        // menu, both of which are main-thread-only.
+        while let Ok(status) = update_rx.try_recv() {
+            update_status = status;
+            push_update_status(&settings_window, &update_status);
+            if let Some(active) = tray.as_mut() {
+                active.set_update(&update_status);
+            }
+        }
+
         // --- Settings saves ------------------------------------------------
         //
         // Handled on the UI thread: a successful save reloads the theme, which
@@ -608,6 +643,17 @@ fn main() {
                             });
                         }
                     }
+                }
+                settings::SettingsRequest::CheckUpdate => {
+                    request_update_check(&update_tx, &mut update_status, true);
+                }
+                settings::SettingsRequest::InstallUpdate => {
+                    request_update_install(
+                        &update_tx,
+                        &mut update_status,
+                        launcher.clone(),
+                        &theme_source,
+                    );
                 }
             }
         }
@@ -1075,12 +1121,189 @@ struct SettingsWindow {
 }
 
 /// Open the settings window, or bring an existing one forward.
+/// Start the DSH host, undoing a bad upgrade if it will not come up.
+///
+/// An upgrade is applied while the old version is still running in memory, so
+/// the previous launch is the first honest test of the new tree. If a note says
+/// an upgrade is on trial and no host can be started, the previous version is
+/// restored and the host tried once more — the difference between a bad release
+/// costing a click and costing a hand-repaired install.
+///
+/// Exactly one rollback attempt is made, so a failure that is not the upgrade's
+/// fault still reports its real error instead of cycling.
+fn spawn_host(
+    url_tx: std::sync::mpsc::Sender<Result<server::DshServer, String>>,
+    launcher: std::path::PathBuf,
+    port: u16,
+) {
+    std::thread::Builder::new()
+        .name("dsh-launch".into())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(err) => {
+                    let _ = url_tx.send(Err(format!("tokio runtime: {err}")));
+                    return;
+                }
+            };
+
+            let mut attempt = 0;
+            let result = loop {
+                attempt += 1;
+                let program = launcher.to_string_lossy().into_owned();
+                match runtime.block_on(server::start(program, port)) {
+                    Ok(started) => {
+                        // The new tree can run. Stop watching it; from here on a
+                        // crash is an ordinary crash, not a failed upgrade.
+                        if let Some(install) = updater::Install::discover(&launcher) {
+                            updater::clear_pending(&install);
+                        }
+                        break Ok(started);
+                    }
+                    Err(err) => {
+                        let install = updater::Install::discover(&launcher);
+                        let pending = install.as_ref().and_then(updater::pending);
+                        match (attempt, install, pending) {
+                            (1, Some(install), Some(target)) => {
+                                tracing::error!(
+                                    %err,
+                                    %target,
+                                    "the upgraded DSH would not start; rolling back"
+                                );
+                                if let Err(rollback_err) = updater::rollback(&install) {
+                                    // Nothing more to try: report the rollback
+                                    // failure, which is the actionable one.
+                                    break Err(format!(
+                                        "the upgraded DSH would not start ({err}), and rolling \
+                                         back failed too: {rollback_err}"
+                                    ));
+                                }
+                                updater::clear_pending(&install);
+                                tracing::warn!("restored the previous DSH; retrying the host");
+                            }
+                            _ => break Err(err),
+                        }
+                    }
+                }
+            };
+
+            // The runtime must outlive the server it supervises, so leak it into
+            // a parked thread rather than dropping it here.
+            std::mem::forget(runtime);
+            let _ = url_tx.send(result);
+        })
+        .expect("spawn dsh launcher thread");
+}
+
+/// Start a registry check on a worker thread.
+///
+/// The check is a network round trip, so it never runs on the UI thread. The
+/// worker reports through `tx`, and the loop renders the result.
+fn request_update_check(
+    tx: &std::sync::mpsc::Sender<updater::Status>,
+    status: &mut updater::Status,
+    force: bool,
+) {
+    // Show the transient state immediately rather than when the answer lands.
+    status.phase = updater::Phase::Checking;
+    let channel = status.channel;
+    let tx = tx.clone();
+    let launcher = launcher_for_updates();
+    std::thread::spawn(move || {
+        let (result, _) = updater::check(&launcher, channel, force);
+        let _ = tx.send(result);
+    });
+}
+
+/// Stage, verify and apply the newest DSH on the configured channel.
+///
+/// Staging and applying are one operation from the user's point of view: a
+/// staged tree that is never applied is just 280 MB of litter, so a failure at
+/// either step reports as one failure with the live install untouched.
+fn request_update_install(
+    tx: &std::sync::mpsc::Sender<updater::Status>,
+    status: &mut updater::Status,
+    launcher: std::path::PathBuf,
+    theme_source: &ThemeSource,
+) {
+    status.phase = updater::Phase::Working;
+    let channel = updater::Channel::parse(&theme_source.current().update_channel)
+        .unwrap_or_default();
+    let tx = tx.clone();
+    std::thread::spawn(move || {
+        let (mut result, install) = updater::check(&launcher, channel, true);
+        // A check that failed must not be followed by an install attempt.
+        if !matches!(result.phase, updater::Phase::Available) {
+            let _ = tx.send(result);
+            return;
+        }
+        let (Some(install), Some(target)) = (install, result.target.clone()) else {
+            result.phase = updater::Phase::Failed("nothing to install".into());
+            let _ = tx.send(result);
+            return;
+        };
+
+        if let Err(err) = updater::stage(&install, &target) {
+            updater::discard_stage(&install, &target);
+            result.phase = updater::Phase::Failed(err);
+            let _ = tx.send(result);
+            return;
+        }
+        if let Err(err) = updater::apply(&install, &target) {
+            updater::discard_stage(&install, &target);
+            result.phase = updater::Phase::Failed(err);
+            let _ = tx.send(result);
+            return;
+        }
+
+        // Note the target so the next launch can put the old tree back if this
+        // one cannot start a host; see `spawn_host`.
+        if let Err(err) = updater::record_pending(&install, &target) {
+            tracing::warn!(%err, "could not record the pending upgrade");
+        }
+
+        // We are running the old DSH in memory while the new one is on disk, so
+        // a restart is what actually applies it.
+        result.phase = updater::Phase::RestartRequired;
+        let _ = tx.send(result);
+    });
+}
+
+/// The launcher the shell resolved at startup, for the update workers.
+///
+/// A `OnceLock` rather than a parameter because the helpers are called from the
+/// event loop's closure, where threading another owned value to every call site
+/// for a value that never changes would be noise.
+static UPDATE_LAUNCHER: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+fn launcher_for_updates() -> std::path::PathBuf {
+    UPDATE_LAUNCHER
+        .get()
+        .cloned()
+        .unwrap_or_else(|| std::path::PathBuf::from("dsh"))
+}
+
+/// Push an update status into the settings page, if it is open.
+fn push_update_status(window: &Option<SettingsWindow>, status: &updater::Status) {
+    if let Some(active) = window.as_ref() {
+        let script = format!(
+            "window.__dshUpdate && window.__dshUpdate.set({});",
+            status.json()
+        );
+        let _ = active.webview.evaluate_script(&script);
+    }
+}
+
 fn open_settings(
     slot: &mut Option<SettingsWindow>,
     event_loop: &tao::event_loop::EventLoopWindowTarget<()>,
     theme_source: &ThemeSource,
     link: &bridge::PluginLink,
     tx: &std::sync::mpsc::Sender<(String, settings::SettingsRequest)>,
+    update: &updater::Status,
 ) {
     if let Some(existing) = slot.as_ref() {
         existing.window.set_visible(true);
@@ -1108,6 +1331,7 @@ fn open_settings(
             &theme,
             link.is_connected(),
             theme_source.locale(),
+            update,
         ))
         .with_ipc_handler(move |request| {
             let body = request.body().to_string();

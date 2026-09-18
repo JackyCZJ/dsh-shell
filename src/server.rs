@@ -169,10 +169,14 @@ fn find_dsh_under(root: &std::path::Path) -> Option<String> {
 
 /// Spawn `dsh web` and resolve its authenticated URL.
 ///
-/// `dsh_program` is the launcher path; `port` of 0 lets the OS choose, which
-/// avoids collisions with an already-running GUI.
+/// `dsh_program` is the *resolved* launcher path; `port` of 0 lets the OS choose,
+/// which avoids collisions with an already-running GUI.
+///
+/// The caller resolves it through [`resolve_launcher`] and hands the result to
+/// both this function and the updater, so the tree the shell runs and the tree
+/// an upgrade replaces are guaranteed to be the same one.
 pub async fn start(dsh_program: String, port: u16) -> Result<DshServer, String> {
-    let launcher = resolve_launcher(&dsh_program);
+    let launcher = dsh_program;
     tracing::info!(launcher = %launcher, "starting host");
 
     let mut command = Command::new(&launcher);

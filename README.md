@@ -48,6 +48,7 @@ runtime it was trying to avoid in the first place.
 | **Remembers the window** | Size, position, and zoom come back on the next launch |
 | **Dock reopen** | Clicking the dock icon restores a hidden or minimized window |
 | **Dock badge + tray count** | Finished turns you have not looked at, as a red number on the dock icon and the same number beside the menu-bar icon; clears when the window is in front again |
+| **Upgrading the DSH it runs** | Checks the registry once per launch (cached), and on request stages, verifies and swaps in a newer DSH — rolling itself back if the new one will not start. Nothing installs without a click |
 | **A readable log** | Diagnostics go to `$DSH_HOME/cache/dsh-shell/dsh-shell.log`, not to a terminal a GUI app does not have |
 | **Plugin bridge** | A real DSH Host plugin forwards `agent/*` events to the shell |
 
@@ -305,6 +306,47 @@ you drag rather than at exit, so a window lost to a crash still reopens where it
 was; a position that no longer lands on an attached display is discarded rather
 than applied off-screen.
 
+### Upgrading the DSH it runs
+
+The shell carries no DSH of its own — it runs whatever `resolve_launcher` finds,
+which for a normal install is `~/.bun/bin/dsh` pointing into bun's global tree.
+Keeping that current is `src/updater.rs`, driven from the Updates section of the
+settings window and from **Check for DSH Updates…** in the tray menu.
+
+- **Detection is automatic, applying is not.** One check per launch, satisfied
+  from a cached answer (`$DSH_HOME/cache/dsh-shell/update.json`) until it is 24
+  hours old, so a launch never waits on the network. Nothing is ever installed
+  without a click: this project publishes release candidates, and an unattended
+  apply could move someone onto a broken prerelease overnight.
+- **The channel is a setting** (`updateChannel`, `latest` or `alpha`). A range is
+  not a version: `^0.1.5-rc.1` is satisfied by `0.1.6-alpha.2`, so the target is
+  always an explicit version taken from a dist-tag.
+- **Upgrading never uses `bun install -g` in place.** Measured: that left 23
+  packages at the old version and 208 at the new one, because bun reuses the
+  global lockfile's resolutions. A fresh resolve in an empty directory produced
+  231 consistent ones. So the new tree is resolved into a staging directory, the
+  staged launcher is run to prove it starts, and only then is it swapped in.
+- **The swap keeps the previous tree.** Both renames are inside one filesystem,
+  so each is atomic; the old tree is moved aside rather than deleted, making a
+  rollback a rename instead of a 280 MB download.
+- **A bad release undoes itself.** `apply` cannot know whether the new tree boots
+  — the old version is still live in memory — so it writes a note naming the
+  target. The next launch that cannot start a host treats that as the verdict:
+  restore the previous tree, clear the note, try once more. Once, so a failure
+  unrelated to the upgrade reports its own error instead of cycling.
+
+The last step is a restart, because the running host is the old version. The
+settings window says so; the shell does not restart itself, since on a machine
+where the shell hosts a DSH session that would kill the session.
+
+Two mistakes here are worth not repeating, both of which failed while looking
+like something else. Polling a child's exit status while its stdout is piped
+deadlocks once the child fills the 64 KB pipe buffer — the registry document is
+142 KB, so every check "timed out" on a working network; the reader now runs on
+its own thread. And canonicalising the launcher's symlink yields a `lib/bin.js`
+that is not executable, so `Install` keeps the path to *run* and the resolved
+path to *read the layout from* separately.
+
 ### Two threading rules
 
 Both were learned the hard way and are worth knowing before extending this:
@@ -443,7 +485,7 @@ xcrun stapler staple "DSH Shell.app"
 
 ```sh
 cargo run          # run from source
-cargo test         # 122 tests
+cargo test         # 164 tests
 cargo clippy       # lints
 ./scripts/make-icon.py   # regenerate the .icns from assets/app-icon.png
 ```
@@ -502,7 +544,7 @@ Everything below was exercised against a real DSH install on macOS 26 (arm64):
 
 | Part | Evidence |
 |---|---|
-| Builds | `cargo build` clean, zero warnings, 122 tests passing |
+| Builds | `cargo build` clean, 164 tests passing |
 | Window | Hidden titlebar, inset traffic lights, drag strip |
 | Renders DSH | Full web UI — sidebar, conversations, composer, cost meter |
 | Host supervision | Spawns `dsh web --no-open`, parses its authenticated URL |
@@ -519,6 +561,8 @@ Everything below was exercised against a real DSH install on macOS 26 (arm64):
 | **Window state** | Resized to 1000×640 at (300, 120), `kill -9`'d, relaunched at exactly that rectangle |
 | **Dock reopen** | Window minimized → `open -a` (the reopen event) → `AXMinimized` `true` → `false` |
 | **App icon** | All ten `.icns` sizes re-decoded through CoreGraphics: alpha corners `0`, mid-edge runs exactly 412/512 and 824/1024, area fill 0.6169 against the system icons' 0.6173 |
+| **DSH upgrade path** | An ignored test stages `0.1.5-rc.2` from the live registry, applies it, runs the launcher at its final path, and rolls back; a sandboxed app copy wrote `update.json` from the real registry |
+| **Upgrade rollback** | A fake live tree whose launcher exits non-zero: the log shows `the upgraded DSH would not start; rolling back`, the previous tree is restored, and the note is cleared |
 | **Notifications** | A banner appeared with the shell's title, body, and whale icon; the previous backend delivered nothing at all |
 
 ## Known gaps
@@ -535,7 +579,13 @@ Everything below was exercised against a real DSH install on macOS 26 (arm64):
 - **Not notarized.** Local use only until a Developer ID is applied. A bundled
   runtime makes this harder, not easier: the bun binary and every native module
   under `node_modules` is another Mach-O that has to be signed.
-- **No auto-update.** A new build has to be installed by hand.
+- **No auto-update of the app itself.** The shell can upgrade the *DSH* it runs,
+  but a new build of the shell still has to be installed by hand — a hand-built
+  local bundle has no channel to update from.
+- **An applied DSH upgrade needs a restart** to take effect, and the shell will
+  not restart itself: where it hosts a DSH session, doing so ends that session.
+  It says so in the settings window instead. A *bad* upgrade is still caught —
+  the next launch rolls it back if no host starts.
 - **Language changes need a restart** for the tray and the app menu, which are
   built once at startup. The settings window picks up a change when reopened.
 - **An unsigned (ad-hoc) build cannot notify**, by design of the platform. See

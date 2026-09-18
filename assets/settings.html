@@ -64,6 +64,14 @@
   .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 22px; }
   .inline { display: flex; gap: 8px; align-items: center; }
   .inline input[type=number] { width: 76px; }
+  .versions { display: flex; gap: 8px; align-items: center; }
+  select {
+    font: inherit; padding: 5px 8px; border-radius: 6px; min-width: 140px;
+    border: 1px solid var(--border); background: var(--surface); color: var(--text);
+  }
+  #update_status.busy { color: var(--muted); }
+  #update_status.ok { color: var(--ok); }
+  #update_status.err { color: var(--danger); }
   footer {
     position: fixed; left: 0; right: 0; bottom: 0;
     display: flex; align-items: center; gap: 10px;
@@ -116,6 +124,35 @@
     <div class="hint" data-i18n="cssHint"></div>
   </section>
 
+  <section>
+    <h2 data-i18n="updates">Updates</h2>
+    <div class="row">
+      <label for="update_channel" data-i18n="channel">Release channel</label>
+      <div class="grow">
+        <select id="update_channel">
+          <option value="latest" data-i18n="channelLatest"></option>
+          <option value="alpha" data-i18n="channelAlpha"></option>
+        </select>
+        <div class="hint" data-i18n="channelHint"></div>
+      </div>
+    </div>
+    <div class="row">
+      <label data-i18n="installed">Installed</label>
+      <div class="grow versions">
+        <code id="current_version">—</code>
+        <span id="update_arrow" hidden>&rarr; <code id="target_version"></code></span>
+      </div>
+    </div>
+    <div class="row">
+      <label></label>
+      <div class="grow inline">
+        <button id="check_update" data-i18n="checkNow">Check Now</button>
+        <button id="install_update" class="primary" data-i18n="installUpdate" hidden>Upgrade</button>
+      </div>
+    </div>
+    <div class="hint" id="update_status"></div>
+  </section>
+
   <footer>
     <span class="msg" id="msg"></span>
     <button id="revert" data-i18n="revert">Revert</button>
@@ -140,6 +177,21 @@
       dark: 'Dark',
       customCss: 'Custom CSS',
       cssHint: 'Appended after the generated rules, so it wins.',
+      updates: 'Updates',
+      channel: 'Release channel',
+      channelLatest: 'Stable (latest tag)',
+      channelAlpha: 'Alpha (alpha tag)',
+      channelHint: 'Save the new channel before checking. Nothing is installed unless you click Upgrade.',
+      installed: 'Installed',
+      checkNow: 'Check Now',
+      installUpdate: 'Upgrade DSH',
+      updateChecking: 'Checking…',
+      updateWorking: 'Downloading and verifying… this takes a few seconds.',
+      updateCurrent: 'Up to date.',
+      updateAvailable: 'Version {target} is available.',
+      updateApplied: 'Upgraded to {target}. Restarting the host — this window may reload.',
+      updateFailed: 'Update failed',
+      updateUnknown: 'Not checked yet.',
       save: 'Save',
       revert: 'Revert',
       saving: 'Saving…',
@@ -168,6 +220,21 @@
       dark: '暗色',
       customCss: '自定义 CSS',
       cssHint: '追加在生成规则之后，因此优先级最高。',
+      updates: '更新',
+      channel: '发布通道',
+      channelLatest: '稳定版（latest 标签）',
+      channelAlpha: 'Alpha 版（alpha 标签）',
+      channelHint: '切换通道后请先保存再检查。除非你点击升级，否则不会安装任何东西。',
+      installed: '当前版本',
+      checkNow: '检查更新',
+      installUpdate: '升级 DSH',
+      updateChecking: '检查中…',
+      updateWorking: '正在下载并验证…需要几秒。',
+      updateCurrent: '已是最新版本。',
+      updateAvailable: '发现新版本 {target}。',
+      updateApplied: '已升级到 {target}，正在重启 host —— 此窗口可能会重新加载。',
+      updateFailed: '更新失败',
+      updateUnknown: '尚未检查。',
       save: '保存',
       revert: '还原',
       saving: '保存中…',
@@ -187,7 +254,22 @@
     },
   };
   let LANG = window.__DSH_LOCALE__ || 'en';
-  const t = (key) => (MESSAGES[LANG] || MESSAGES.en)[key] || key;
+  /**
+   * Look up a string, substituting `{name}` placeholders.
+   *
+   * Placeholders rather than concatenation so a translation can put the value
+   * where its own grammar wants it — the version is not in the same position in
+   * both languages.
+   */
+  const t = (key, values) => {
+    let text = (MESSAGES[LANG] || MESSAGES.en)[key] || key;
+    if (values) {
+      for (const [name, value] of Object.entries(values)) {
+        text = text.split('{' + name + '}').join(value);
+      }
+    }
+    return text;
+  };
 
   /** Apply the strings to the static parts of the document. */
   function applyStrings() {
@@ -274,6 +356,7 @@
     buildPalette('dark', theme.dark);
     el('hotkey').value = theme.hotkey || 'meta+shift+D';
     el('custom_css').value = theme.custom_css || '';
+    el('update_channel').value = theme.updateChannel || 'latest';
 
     for (const name of ['light', 'dark']) {
       const palette = theme[name] || {};
@@ -304,6 +387,9 @@
       light: palette('light'),
       dark: palette('dark'),
       customCss: el('custom_css').value,
+      // Saved with everything else rather than sent with the check, so the
+      // channel in the document and the channel being checked cannot disagree.
+      updateChannel: el('update_channel').value,
     };
   }
 
@@ -365,10 +451,84 @@
     },
   };
 
+  // --- Updates ---------------------------------------------------------------
+  //
+  // The shell owns every decision here: it knows the launcher it runs, checks
+  // the registry, and does the install. This page renders a status object and
+  // sends back two verbs.
+
+  let updateStatus = window.__DSH_UPDATE__ || { phase: 'unknown' };
+  const statusEl = el('update_status');
+
+  /** Ask the shell to do something about updates. */
+  function postUpdate(action) {
+    if (window.ipc && window.ipc.postMessage) {
+      window.ipc.postMessage(JSON.stringify({ action }));
+    } else {
+      statusEl.textContent = t('noIpc');
+      statusEl.className = 'hint err';
+    }
+  }
+
+  const setStatus = (text, kind) => {
+    statusEl.textContent = text;
+    statusEl.className = 'hint' + (kind ? ' ' + kind : '');
+  };
+
+  /** Render a status object from the shell. */
+  function renderUpdate(status) {
+    updateStatus = status || { phase: 'unknown' };
+    const phase = updateStatus.phase || 'unknown';
+    const busy = !!updateStatus.busy;
+
+    el('current_version').textContent = updateStatus.current || '—';
+    const hasTarget = !!updateStatus.target;
+    const showTarget = hasTarget && (phase === 'available' || phase === 'restartRequired');
+    el('update_arrow').hidden = !showTarget;
+    if (showTarget) el('target_version').textContent = updateStatus.target;
+
+    // The install button appears only when there is something to install, so it
+    // can never be the thing that installs an unreviewed version by accident.
+    const install = el('install_update');
+    install.hidden = phase !== 'available';
+    install.disabled = busy || !hostConnected;
+    el('check_update').disabled = busy;
+
+    if (phase === 'checking') setStatus(t('updateChecking'), 'busy');
+    else if (phase === 'working') setStatus(t('updateWorking'), 'busy');
+    else if (phase === 'current') setStatus(t('updateCurrent'), 'ok');
+    else if (phase === 'available') setStatus(t('updateAvailable', { target: updateStatus.target }), 'ok');
+    else if (phase === 'restartRequired') setStatus(t('updateApplied', { target: updateStatus.target }), 'ok');
+    else if (phase === 'failed' || phase === 'unsupported') {
+      // A failure reason comes from the shell and is shown verbatim: it is the
+      // only actionable part.
+      setStatus((updateStatus.message || t('updateFailed')), 'err');
+    } else {
+      setStatus(t('updateUnknown'));
+    }
+  }
+
+  el('check_update').addEventListener('click', () => {
+    renderUpdate({ ...updateStatus, phase: 'checking', busy: true });
+    postUpdate('checkUpdate');
+  });
+
+  el('install_update').addEventListener('click', () => {
+    renderUpdate({ ...updateStatus, phase: 'working', busy: true });
+    postUpdate('installUpdate');
+  });
+
+  window.__dshUpdate = {
+    set(status) {
+      renderUpdate(status);
+    },
+  };
+
   // Strings first, so the static chrome is localised before anything renders.
   applyStrings();
   load(INITIAL);
   refreshSaveState();
+  renderUpdate(updateStatus);
   if (!hostConnected) {
     setMessage(t('hostDown'), 'err');
   }

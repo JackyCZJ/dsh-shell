@@ -134,6 +134,12 @@ pub struct Theme {
     pub dark: Palette,
     /// Extra CSS appended after the generated rules.
     pub custom_css: String,
+    /// Which DSH release line to upgrade along: `"latest"` or `"alpha"`.
+    ///
+    /// A channel rather than a version, because pinning an exact version in a
+    /// document a human edits is a worse interface than "keep me on the stable
+    /// line" — and the current version changes without anyone editing this.
+    pub update_channel: String,
 }
 
 impl Default for Theme {
@@ -143,6 +149,7 @@ impl Default for Theme {
             light: Palette::deepseek_light(),
             dark: Palette::deepseek_dark(),
             custom_css: String::new(),
+            update_channel: "latest".to_string(),
         }
     }
 }

@@ -29,13 +29,22 @@ pub fn page(
     theme: &Theme,
     host_connected: bool,
     locale: crate::i18n::Locale,
+    update: &crate::updater::Status,
 ) -> String {
     let json = serde_json::to_string(theme).unwrap_or_else(|_| "{}".into());
     // `</script>` inside the JSON would end the script block early. The theme
     // contains CSS text, which can legitimately include angle brackets.
     let safe = json.replace("</", "<\\/");
+    // The update status is injected the same way for the same reason: the page
+    // is usable the moment it paints, with no round trip to ask the shell.
+    //
+    // `Value::to_string`, not `serde_json::to_string`: the latter encodes the
+    // value *as JSON*, so a string would carry its quotes into the page. The
+    // page expects an object, and a string would read as `phase: undefined`.
+    let update_json = update.json().to_string();
     SETTINGS_HTML
         .replace("window.__DSH_INITIAL__ || {}", &format!("{safe}"))
+        .replace("window.__DSH_UPDATE__ || { phase: 'unknown' }", &update_json)
         .replace(
             "window.__DSH_HOST_CONNECTED__ || false",
             if host_connected { "true" } else { "false" },
@@ -52,6 +61,10 @@ pub fn page(
 pub enum SettingsRequest {
     /// Validate and persist the given configuration.
     Save { config: serde_json::Value },
+    /// Look for a newer DSH, bypassing the cached answer.
+    CheckUpdate,
+    /// Stage, verify and apply the newest DSH on the configured channel.
+    InstallUpdate,
 }
 
 /// The outcome reported back to the page.
@@ -114,7 +127,7 @@ mod tests {
 
     #[test]
     fn the_page_embeds_the_locale() {
-        let html = page(&Theme::default(), true, crate::i18n::Locale::Zh);
+        let html = page(&Theme::default(), true, crate::i18n::Locale::Zh, &crate::updater::Status::default());
         assert!(
             html.contains("\"zh\""),
             "locale was not injected into the page"
@@ -131,7 +144,7 @@ mod tests {
         theme.hotkey = "meta+alt+K".into();
         theme.light.accent = crate::theme::ColorHex(0x123456);
 
-        let html = page(&theme, true, crate::i18n::Locale::En);
+        let html = page(&theme, true, crate::i18n::Locale::En, &crate::updater::Status::default());
         assert!(html.contains("meta+alt+K"), "hotkey missing from the page");
         assert!(html.contains("#123456"), "accent missing from the page");
         assert!(
@@ -145,12 +158,103 @@ mod tests {
         );
     }
 
+    /// The page's script, as the browser would parse it.
+    ///
+    /// `node --check` is the only JavaScript parser this project can reach
+    /// without a browser or a dependency, and it is a real one — it caught the
+    /// update status being injected as a JSON-encoded *string* rather than an
+    /// object, which no string assertion here would have noticed.
+    fn assert_page_script_parses(html: &str) {
+        let start = html.find("<script>").expect("the page has a script block");
+        let body = &html[start + "<script>".len()..];
+        let end = body.find("</script>").expect("the script block is closed");
+        let script = &body[..end];
+
+        let dir = std::env::temp_dir().join(format!("dsh-settings-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("settings.js");
+        std::fs::write(&path, script).expect("write the extracted script");
+
+        let output = std::process::Command::new("node")
+            .arg("--check")
+            .arg(&path)
+            .output();
+        let _ = std::fs::remove_file(&path);
+
+        match output {
+            Ok(output) => assert!(
+                output.status.success(),
+                "the settings script does not parse:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            // No node on this machine; the check is skipped rather than failed.
+            Err(_) => eprintln!("node not found; skipping the script parse check"),
+        }
+    }
+
     #[test]
-    fn a_theme_containing_a_script_tag_cannot_break_out() {
-        // custom_css is free text and can contain "</script>".
+    fn the_page_script_parses() {
+        assert_page_script_parses(&page(
+            &Theme::default(),
+            true,
+            crate::i18n::Locale::En,
+            &crate::updater::Status::default(),
+        ));
+    }
+
+    #[test]
+    fn the_page_script_still_parses_with_a_failure_status() {
+        // The failure reason is arbitrary text from a command's stderr, so it is
+        // the most likely thing to carry a quote or a newline into the page.
+        let status = crate::updater::Status {
+            channel: crate::updater::Channel::Alpha,
+            phase: crate::updater::Phase::Failed(
+                "curl exited 6: could not resolve host \"registry.npmjs.org\"\nsecond line".into(),
+            ),
+            current: Some(crate::updater::Version::parse("0.1.5-rc.2").unwrap()),
+            target: None,
+            message: None,
+            checked_at: Some(1),
+        };
+        assert_page_script_parses(&page(
+            &Theme::default(),
+            false,
+            crate::i18n::Locale::Zh,
+            &status,
+        ));
+    }
+
+    #[test]
+    fn the_page_receives_the_update_status_as_an_object() {
+        let status = crate::updater::Status {
+            current: Some(crate::updater::Version::parse("0.1.5-rc.2").unwrap()),
+            target: Some(crate::updater::Version::parse("0.1.6-alpha.2").unwrap()),
+            channel: crate::updater::Channel::Alpha,
+            phase: crate::updater::Phase::Available,
+            message: None,
+            checked_at: Some(5),
+        };
+        let html = page(&Theme::default(), true, crate::i18n::Locale::En, &status);
+        assert!(
+            !html.contains("window.__DSH_UPDATE__ || { phase: 'unknown' }"),
+            "the update placeholder was not substituted"
+        );
+        // An object literal, not a quoted string: the page reads `.phase` off it.
+        // Not asserted against the literal key order — `serde_json` is built here
+        // with `preserve_order` (through tao/wry), so keys come out sorted.
+        assert!(
+            html.contains("{\"") && html.contains("\"current\":\"0.1.5-rc.2\""),
+            "the status should be injected as a JSON object, not a quoted string"
+        );
+        assert!(html.contains("\"phase\":\"available\""));
+        assert!(html.contains("\"channel\":\"alpha\""));
+    }
+
+    #[test]
+    fn a_theme_containing_a_script_tag_cannot_break_out() {        // custom_css is free text and can contain "</script>".
         let mut theme = Theme::default();
         theme.custom_css = "/* </script><script>alert(1)</script> */".into();
-        let html = page(&theme, false, crate::i18n::Locale::En);
+        let html = page(&theme, false, crate::i18n::Locale::En, &crate::updater::Status::default());
         assert!(
             !html.contains("</script><script>alert(1)"),
             "a script tag in custom_css escaped the injection block"
@@ -218,6 +322,33 @@ mod tests {
         assert!(parse_request("not json").is_err());
         assert!(parse_request(r#"{"action":"nope"}"#).is_err());
         assert!(parse_request(r#"{"action":"save","config":{}}"#).is_ok());
+    }
+
+    #[test]
+    fn parses_the_update_actions_the_page_sends() {
+        // These arrive as bare verbs: the shell decides which version to touch,
+        // so there is nothing for the page to pass.
+        assert!(matches!(
+            parse_request(r#"{"action":"checkUpdate"}"#),
+            Ok(SettingsRequest::CheckUpdate)
+        ));
+        assert!(matches!(
+            parse_request(r#"{"action":"installUpdate"}"#),
+            Ok(SettingsRequest::InstallUpdate)
+        ));
+        // A misspelt verb must not silently become one of them.
+        assert!(parse_request(r#"{"action":"checkupdate"}"#).is_err());
+        assert!(parse_request(r#"{"action":"InstallUpdate"}"#).is_err());
+    }
+
+    #[test]
+    fn the_update_channel_is_saved_with_the_rest_of_the_configuration() {
+        // The channel lives in the document rather than travelling with the
+        // check, so the stored value and the checked value cannot disagree.
+        let mut config = valid_config();
+        config["updateChannel"] = serde_json::json!("alpha");
+        let theme = validate(&config).expect("alpha is a valid channel");
+        assert_eq!(theme.update_channel, "alpha");
     }
 
     #[test]

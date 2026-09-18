@@ -80,6 +80,15 @@ pub struct Strings {
     pub agent_working: &'static str,
     pub agent_failed: &'static str,
 
+    // Updates. The tray shows the version and whether a newer one exists; the
+    // settings window carries the detail, so there are no failure strings here.
+    pub version_prefix: &'static str,
+    pub version_unknown: &'static str,
+    pub check_for_updates: &'static str,
+    pub update_available_short: &'static str,
+    pub update_working: &'static str,
+    pub update_restart: &'static str,
+
     // Application menu
     pub menu_edit: &'static str,
     pub menu_view: &'static str,
@@ -110,6 +119,13 @@ static EN: Strings = Strings {
     agent_working: "working",
     agent_failed: "failed",
 
+    version_prefix: "DSH",
+    version_unknown: "Version unknown",
+    check_for_updates: "Check for DSH Updates…",
+    update_available_short: "DSH update available",
+    update_working: "Upgrading DSH…",
+    update_restart: "Restart to finish",
+
     menu_edit: "Edit",
     menu_view: "View",
     menu_window: "Window",
@@ -136,6 +152,13 @@ static ZH: Strings = Strings {
     agent_idle: "空闲",
     agent_working: "工作中",
     agent_failed: "失败",
+
+    version_prefix: "DSH",
+    version_unknown: "版本未知",
+    check_for_updates: "检查 DSH 更新…",
+    update_available_short: "DSH 有可用更新",
+    update_working: "正在升级 DSH…",
+    update_restart: "重启后生效",
 
     menu_edit: "编辑",
     menu_view: "显示",

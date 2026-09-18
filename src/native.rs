@@ -67,6 +67,12 @@ pub struct Tray {
     show_item: MenuItem,
     settings_item: MenuItem,
     quit_item: MenuItem,
+    /// Says what the DSH behind the window is on, and whether a newer one
+    /// exists. Disabled, because it reports rather than acts.
+    version_item: MenuItem,
+    /// Asks for a check; shares its label with `version_item` in spirit, but is
+    /// clickable.
+    update_item: MenuItem,
     pub state: AgentState,
     /// A short label contributed by a plugin, shown after the agent state.
     plugin_label: Option<String>,
@@ -91,12 +97,19 @@ impl Tray {
         let show_item = MenuItem::new(t.show_window, true, None);
         let settings_item = MenuItem::new(t.settings, true, None);
         let quit_item = MenuItem::new(t.quit, true, None);
+        // The version row starts blank: the tray is built before anything has
+        // asked the launcher what it is, and a placeholder would be a lie.
+        let version_item = MenuItem::new(t.version_unknown, false, None);
+        let update_item = MenuItem::new(t.check_for_updates, true, None);
 
         menu.append_items(&[
             &state_item,
             &PredefinedMenuItem::separator(),
             &show_item,
             &settings_item,
+            &PredefinedMenuItem::separator(),
+            &update_item,
+            &version_item,
             &PredefinedMenuItem::separator(),
             &quit_item,
         ])
@@ -115,11 +128,52 @@ impl Tray {
             show_item,
             settings_item,
             quit_item,
+            version_item,
+            update_item,
             state: AgentState::Idle,
             plugin_label: None,
             badge: None,
             locale,
         })
+    }
+
+    /// Reflect the updater's state in the menu.
+    ///
+    /// Only two things are worth a menu row: the version in use, and whether a
+    /// newer one exists. The full story lives in the settings window, because a
+    /// menu is the wrong place to read a failure reason.
+    ///
+    /// `let _ =` on the setters is deliberate rather than redundant: `muda`'s
+    /// `set_text`/`set_enabled` return `()` today, and a result-valued signature
+    /// later would otherwise become an `unused_must_use` warning here.
+    #[allow(clippy::let_unit_value)]
+    pub fn set_update(&mut self, status: &crate::updater::Status) {
+        let t = self.locale.strings();
+        let current = status
+            .current
+            .as_ref()
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| t.version_unknown.to_string());
+        let label = match status.phase {
+            crate::updater::Phase::Available => {
+                let target = status
+                    .target
+                    .as_ref()
+                    .map(|v| v.to_string())
+                    .unwrap_or_default();
+                format!("{} → {target}", t.update_available_short)
+            }
+            crate::updater::Phase::Working => t.update_working.to_string(),
+            crate::updater::Phase::RestartRequired => t.update_restart.to_string(),
+            _ => format!("{}: {current}", t.version_prefix),
+        };
+        let _ = self.version_item.set_text(label);
+        // Offer a check whenever nothing is in flight; a click while an install
+        // is running would race the worker.
+        let _ = self.update_item.set_enabled(!matches!(
+            status.phase,
+            crate::updater::Phase::Checking | crate::updater::Phase::Working
+        ));
     }
 
     /// Update the tray to reflect a new agent state.
@@ -194,6 +248,10 @@ impl Tray {
 
     pub fn quit_item_id(&self) -> &tray_icon::menu::MenuId {
         self.quit_item.id()
+    }
+
+    pub fn update_item_id(&self) -> &tray_icon::menu::MenuId {
+        self.update_item.id()
     }
 }
 
@@ -501,7 +559,6 @@ mod tests {
         }
     }
 
-    #[test]
     #[test]
     fn no_badge_is_shown_for_nothing_to_report() {
         assert_eq!(badge_label(None), None);
@@ -980,6 +1037,8 @@ fn notify_macos(summary: &str, body: &str) -> Result<(), String> {
 pub enum TrayCommand {
     Show,
     Settings,
+    /// Ask the updater to look for a newer DSH.
+    CheckForUpdates,
     Quit,
 }
 
@@ -989,6 +1048,8 @@ pub fn tray_command(event: &MenuEvent, tray: &Tray) -> Option<TrayCommand> {
         Some(TrayCommand::Show)
     } else if event.id == *tray.settings_item_id() {
         Some(TrayCommand::Settings)
+    } else if event.id == *tray.update_item_id() {
+        Some(TrayCommand::CheckForUpdates)
     } else if event.id == *tray.quit_item_id() {
         Some(TrayCommand::Quit)
     } else {
