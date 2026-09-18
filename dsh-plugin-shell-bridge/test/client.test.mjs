@@ -268,3 +268,38 @@ test('a patch with nothing to check passes', () => {
 	assert.equal(problem({ customCss: 'body { color: red; }' }), null)
 	assert.equal(problem({ updateChannel: 'alpha' }), null)
 })
+
+test('every design token the stylesheet uses exists in DSH', async () => {
+	// A mistyped token name fails silently: `var(--dsw-typo, #fallback)` renders
+	// the fallback, so the form quietly keeps the colours and sizes this was
+	// meant to replace. Three names were wrong when this test was written --
+	// `-sm-13` for `-xs-13`, and a brand token that does not exist -- and none
+	// of them would have shown up on screen as an error.
+	const fs = await import('node:fs')
+	const path = await import('node:path')
+	const os = await import('node:os')
+	const source = fs.readFileSync(BUNDLE, 'utf8')
+	const used = [...new Set([...source.matchAll(/var\((--dsw-[a-z0-9-]+)/g)].map((m) => m[1]))]
+	assert.ok(used.length > 10, 'the stylesheet should be using tokens at all')
+
+	// Read the tokens DSH defines from its own bundles, if this machine has them.
+	const root = path.join(os.homedir(), '.bun/install/global/node_modules/@deepseek-ai')
+	let defined = new Set()
+	try {
+		for (const dir of fs.readdirSync(root)) {
+			for (const file of ['lib/index.js', 'lib/client.js']) {
+				const full = path.join(root, dir, file)
+				if (!fs.existsSync(full)) continue
+				for (const m of fs.readFileSync(full, 'utf8').matchAll(/(--dsw-[a-z0-9-]+)\s*:/g)) {
+					defined.add(m[1])
+				}
+			}
+		}
+	} catch {
+		// No DSH install to compare against; the names are still self-consistent.
+		return
+	}
+	assert.ok(defined.size > 50, 'expected to find DSH tokens to compare against')
+	const unknown = used.filter((token) => !defined.has(token))
+	assert.deepEqual(unknown, [], `unknown design tokens: ${unknown.join(', ')}`)
+})

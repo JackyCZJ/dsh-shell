@@ -619,34 +619,156 @@ window.__ModuleLoader__.load({
 		 * properties so the row follows the theme like everything around it.
 		 */
 		const CSS = `
-.dsh-shell-section { display: flex; flex-direction: column; gap: 22px; max-width: 720px; }
-.dsh-shell-subhead { font-weight: 600; margin-bottom: 6px; }
-.dsh-shell-config { display: flex; flex-direction: column; gap: 16px; }
-.dsh-shell-config-head { border-bottom: 1px solid var(--dsh-border, rgba(128,128,128,.2)); padding-bottom: 8px; }
-.dsh-shell-field { display: flex; flex-direction: column; gap: 6px; }
-.dsh-shell-field-label { font-weight: 500; }
-.dsh-shell-field-body { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
-.dsh-shell-field input[type=text], .dsh-shell-field textarea {
-  font: inherit; width: 100%; box-sizing: border-box; padding: 5px 8px;
-  border-radius: 6px; border: 1px solid var(--dsh-border, rgba(128,128,128,.35));
-  background: var(--dsh-surface, transparent); color: inherit;
+/*
+ * Styled with DSH's own design tokens, not with colours of my own.
+ *
+ * The shell's palette defaults already match them exactly -- accent #4176e6 is
+ * --dsw-static-deepseek-500, muted text #81858c is
+ * --dsw-static-neutral-bluish-600 -- so the values were never the problem; the
+ * form controls were, by using system colours and hardcoded greys that do not
+ * exist anywhere in the app. Every token below has a literal fallback so a host
+ * that does not define it still renders something sane.
+ */
+.dsh-shell-section {
+  display: flex; flex-direction: column; gap: 24px; max-width: 720px;
+  font-family: var(--dsw-font-family, inherit);
 }
-.dsh-shell-field textarea { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 12px; resize: vertical; }
-.dsh-shell-palettes { display: flex; gap: 24px; flex-wrap: wrap; }
-.dsh-shell-palette { flex: 1 1 240px; min-width: 200px; }
-.dsh-shell-colour { display: flex; align-items: center; gap: 8px; }
-.dsh-shell-colour input[type=color] { width: 32px; height: 22px; padding: 0; border: 1px solid var(--dsh-border, rgba(128,128,128,.35)); border-radius: 4px; background: none; }
-.dsh-shell-colour code { font-size: 11px; opacity: .7; }
+.dsh-shell-subhead {
+  font-size: var(--dsw-font-xs-13-font-size, 13px);
+  line-height: var(--dsw-font-xs-13-line-height, 20px);
+  font-weight: var(--dsw-font-base-strong-16-font-weight, 600);
+  color: var(--dsw-alias-label-primary, #0f1115);
+}
+.dsh-shell-hint, .dsh-shell-update-message {
+  font-size: var(--dsw-font-xxs-12-font-size, 12px);
+  line-height: var(--dsw-font-xxs-12-line-height, 18px);
+  color: var(--dsw-alias-label-caption, #81858c);
+}
+.dsh-shell-update-message.is-error { color: var(--dsw-alias-state-error-primary, #d9534f); }
+
+.dsh-shell-config { display: flex; flex-direction: column; gap: 20px; }
+.dsh-shell-config-head {
+  display: flex; flex-direction: column; gap: 4px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--dsw-alias-border-l2, rgba(128,128,128,.2));
+}
+.dsh-shell-field { display: flex; flex-direction: column; gap: 8px; }
+.dsh-shell-field-label {
+  font-size: var(--dsw-font-s-14-font-size, 14px);
+  line-height: var(--dsw-font-s-14-line-height, 22px);
+  color: var(--dsw-alias-label-primary, #0f1115);
+}
+.dsh-shell-field-body { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+
+/* Inputs follow the app's own field look: layer-1 fill, l2 hairline, 8px radius,
+   label-primary text, and the brand colour as the focus ring. */
+.dsh-shell-field input[type=text], .dsh-shell-field textarea {
+  font-family: inherit; width: 100%; box-sizing: border-box;
+  font-size: var(--dsw-font-s-14-font-size, 14px);
+  line-height: var(--dsw-font-s-14-line-height, 22px);
+  padding: 7px 10px; border-radius: 8px;
+  border: 1px solid var(--dsw-alias-border-l2, rgba(128,128,128,.35));
+  background: var(--dsw-alias-bg-layer-1, transparent);
+  color: var(--dsw-alias-label-primary, inherit);
+  transition: border-color .12s ease, box-shadow .12s ease;
+}
+.dsh-shell-field input[type=text]:hover, .dsh-shell-field textarea:hover {
+  border-color: var(--dsw-alias-border-l3, rgba(128,128,128,.5));
+}
+.dsh-shell-field input[type=text]:focus, .dsh-shell-field textarea:focus {
+  outline: none;
+  border-color: var(--dsw-alias-brand-primary, #4176e6);
+  box-shadow: 0 0 0 3px color-mix(in srgb, #4176e6 18%, transparent);
+}
+.dsh-shell-field textarea {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: var(--dsw-font-xxs-12-font-size, 12px);
+  line-height: 1.5; resize: vertical;
+}
+
+.dsh-shell-palettes { display: flex; gap: 32px; flex-wrap: wrap; }
+.dsh-shell-palette { flex: 1 1 260px; min-width: 220px; display: flex; flex-direction: column; gap: 10px; }
+.dsh-shell-palette .dsh-shell-subhead {
+  font-weight: var(--dsw-font-base-16-font-weight, 500);
+  color: var(--dsw-alias-label-secondary, #61666b);
+}
+.dsh-shell-colour { display: flex; align-items: center; gap: 10px; }
+/* The swatch is the control, so it gets the app's border and radius rather than
+   the platform's default bevel. */
+.dsh-shell-colour input[type=color] {
+  width: 34px; height: 24px; padding: 2px; cursor: pointer;
+  border: 1px solid var(--dsw-alias-border-l2, rgba(128,128,128,.35));
+  border-radius: 6px;
+  background: var(--dsw-alias-bg-layer-1, transparent);
+}
+.dsh-shell-colour input[type=color]::-webkit-color-swatch-wrapper { padding: 0; }
+.dsh-shell-colour input[type=color]::-webkit-color-swatch { border: none; border-radius: 4px; }
+.dsh-shell-colour code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: var(--dsw-font-xxxs-11-font-size, 11px);
+  color: var(--dsw-alias-label-tertiary, #979da6);
+}
+
+/* Buttons match the dialog's: secondary is a quiet surface, primary is brand. */
 .dsh-shell-config-actions { display: flex; align-items: center; gap: 8px; }
-.dsh-shell-update-row { display: flex; flex-direction: column; gap: 6px; padding-top: 16px; border-top: 1px solid var(--dsh-border, rgba(128,128,128,.2)); }
-.dsh-shell-update-label { font-weight: 500; }
-.dsh-shell-update-body { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
-.dsh-shell-update-versions { display: flex; align-items: center; gap: 10px; }
-.dsh-shell-update-versions code { font-size: 12px; }
-.dsh-shell-update-channel { font-size: 11px; opacity: .6; }
-.dsh-shell-update-message { font-size: 12px; opacity: .8; }
-.dsh-shell-update-message.is-error { color: var(--dsh-danger, #d9534f); opacity: 1; }
+.dsh-shell-config-actions button {
+  font-family: inherit; cursor: pointer;
+  font-size: var(--dsw-font-xs-13-font-size, 13px);
+  line-height: var(--dsw-font-xs-13-line-height, 20px);
+  padding: 6px 14px; border-radius: 8px;
+  border: 1px solid var(--dsw-alias-border-l2, rgba(128,128,128,.35));
+  background: var(--dsw-alias-bg-layer-1, transparent);
+  color: var(--dsw-alias-label-primary, inherit);
+  transition: background-color .12s ease;
+}
+.dsh-shell-config-actions button:hover:not(:disabled) {
+  background: var(--dsw-alias-interactive-bg-hover, rgba(128,128,128,.12));
+}
+.dsh-shell-config-actions button.primary {
+  background: var(--dsw-alias-brand-primary, #4176e6);
+  border-color: transparent; color: #fff;
+}
+.dsh-shell-config-actions button.primary:hover:not(:disabled) { filter: brightness(1.06); }
+.dsh-shell-config-actions button:disabled { opacity: .45; cursor: default; }
+.dsh-shell-config-actions .dsh-shell-update-message { margin-left: 4px; }
+
+.dsh-shell-update-row {
+  display: flex; flex-direction: column; gap: 6px; padding-top: 20px;
+  border-top: 1px solid var(--dsw-alias-border-l2, rgba(128,128,128,.2));
+}
+.dsh-shell-update-label {
+  font-size: var(--dsw-font-s-14-font-size, 14px);
+  color: var(--dsw-alias-label-primary, #0f1115);
+}
+.dsh-shell-update-body { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.dsh-shell-update-versions { display: flex; align-items: baseline; gap: 10px; }
+.dsh-shell-update-versions code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: var(--dsw-font-xs-13-font-size, 13px);
+  color: var(--dsw-alias-label-primary, inherit);
+}
+.dsh-shell-update-channel {
+  font-size: var(--dsw-font-xxs-12-font-size, 12px);
+  color: var(--dsw-alias-label-tertiary, #979da6);
+}
 .dsh-shell-update-actions { display: flex; gap: 8px; }
+.dsh-shell-update-actions button {
+  font-family: inherit; cursor: pointer;
+  font-size: var(--dsw-font-xs-13-font-size, 13px);
+  line-height: var(--dsw-font-xs-13-line-height, 20px);
+  padding: 6px 14px; border-radius: 8px;
+  border: 1px solid var(--dsw-alias-border-l2, rgba(128,128,128,.35));
+  background: var(--dsw-alias-bg-layer-1, transparent);
+  color: var(--dsw-alias-label-primary, inherit);
+}
+.dsh-shell-update-actions button:hover:not(:disabled) {
+  background: var(--dsw-alias-interactive-bg-hover, rgba(128,128,128,.12));
+}
+.dsh-shell-update-actions button.primary {
+  background: var(--dsw-alias-brand-primary, #4176e6);
+  border-color: transparent; color: #fff;
+}
+.dsh-shell-update-actions button:disabled { opacity: .45; cursor: default; }
 `
 
 		/** Install the stylesheet once, however many times a section mounts. */
