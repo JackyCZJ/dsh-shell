@@ -187,22 +187,41 @@ fi
 #
 # An identity is used when one exists. Ad-hoc stays the fallback so a machine
 # with no certificate can still build a bundle that runs.
+#
+# The identity is passed to `codesign` as its SHA-1 hash, not its common name.
+# `security` prints the name decoded from the certificate's UTF-8 CN, which only
+# round-trips if the shell's locale can encode it; under `LC_CTYPE=C` a name like
+# "Apple Development: 子健 陈 (G3633PQH7T)" reaches codesign as
+# "Apple Development: Â≠êÂÅ• Èôà (G3633PQH7T)" and signing fails outright with
+# "no identity found". Since `set -e` is not in play for that one call, the
+# bundle was left with whatever stale signature it had. A hash is ASCII, so it
+# is immune to this; it also survives a certificate renewal.
 IDENTITY="${CODESIGN_IDENTITY:-}"
+IDENTITY_LABEL=""
 if [[ -z "$IDENTITY" ]]; then
-  IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
-    | sed -n 's/^[^"]*"\(.*\)".*$/\1/p' | head -1)"
+  line="$(security find-identity -v -p codesigning 2>/dev/null | grep -m1 '"')"
+  IDENTITY="$(printf '%s\n' "$line" | awk '{print $2}')"
+  # Only for the log line; the name is never passed to codesign.
+  IDENTITY_LABEL="$(printf '%s\n' "$line" | sed -n 's/^[^"]*"\(.*\)".*$/\1/p')"
 fi
+[[ -n "$IDENTITY_LABEL" ]] || IDENTITY_LABEL="$IDENTITY"
 
 if [[ -n "$IDENTITY" ]]; then
   # The hardened runtime is only needed for notarization, and enabling it
   # without the matching entitlements can break other things, so it is applied
   # to a Developer ID build only.
-  if [[ "$IDENTITY" == Developer\ ID* ]]; then
-    echo "==> signing as: $IDENTITY (hardened runtime)"
-    codesign --force --deep --options runtime --sign "$IDENTITY" "$DIST"
+  if [[ "$IDENTITY_LABEL" == Developer\ ID* ]]; then
+    echo "==> signing as: $IDENTITY_LABEL (hardened runtime)"
+    if ! codesign --force --deep --options runtime --sign "$IDENTITY" "$DIST"; then
+      echo "error: signing failed; refusing to install an unsigned bundle" >&2
+      exit 1
+    fi
   else
-    echo "==> signing as: $IDENTITY"
-    codesign --force --deep --sign "$IDENTITY" "$DIST"
+    echo "==> signing as: $IDENTITY_LABEL"
+    if ! codesign --force --deep --sign "$IDENTITY" "$DIST"; then
+      echo "error: signing failed; refusing to install an unsigned bundle" >&2
+      exit 1
+    fi
   fi
 elif codesign --force --deep --sign - "$DIST" 2>/dev/null; then
   echo "==> ad-hoc signed (no identity found)"
