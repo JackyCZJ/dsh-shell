@@ -274,8 +274,9 @@ src/
   window_state.rs the remembered window rectangle
 assets/
   boot.html       the loading screen
-  deepseek.svg    DSH's official icon
-  deepseek.icns   built from the SVG for the bundle
+  deepseek.svg    DSH's official whale; also the source of the tray glyph
+  app-icon.png    the app icon's source artwork (1024x1024)
+  deepseek.icns   the squircle-masked icon built from it
 # configuration lives in DSH's settings.yaml
 ```
 
@@ -442,14 +443,58 @@ xcrun stapler staple "DSH Shell.app"
 
 ```sh
 cargo run          # run from source
-cargo test         # 112 tests
+cargo test         # 122 tests
 cargo clippy       # lints
-./scripts/make-icon.sh   # regenerate the .icns from the SVG
+./scripts/make-icon.py   # regenerate the .icns from assets/app-icon.png
 ```
 
 The tests cover the parts that are easy to get subtly wrong: URL parsing, CSS
 injection and escaping, the appearance preference parser, theme reload semantics,
 SVG path flattening, and the menu structure that makes the clipboard work.
+
+### The app icon
+
+`scripts/make-icon.py` does the whole job with the standard library: it decodes
+`assets/app-icon.png`, area-averages it down, masks it to the macOS icon shape,
+writes the ten PNGs `iconutil` wants, and runs `iconutil`. It replaced a
+`sips`-based script that rendered `assets/deepseek.svg`, which could not draw the
+mask.
+
+The mask's geometry is measured, not recalled. Extracting the `AppIcon.icns`
+from `Notes`, `Music`, `Calculator` and `Reminders` with `iconutil -c iconset`
+and thresholding the alpha gives identical numbers for all four:
+
+- the icon body spans **206/256** of the canvas, which is Apple's 824/1024 grid;
+- the mid-edge runs are full width, so the shape is a flat-edged rounded
+  rectangle — a superellipse such as `|x|^5 + |y|^5 = 1` is **not** the shape,
+  and curves its edges inward where the real icons stay flat;
+- the corner's implied circular radius is **0.228–0.246** of the body across a
+  10× range of the arc. A superellipse's implied radius drifts far more than
+  that over the same range, which is what rules it out.
+
+`0.235 × body` is 185.6px on a 1024 canvas, against the 185.4 Apple documents
+for the macOS grid. The final check is area: the system icons fill **0.6173** of
+the canvas (0.6199 by coverage-weighted area), and the generated mask fills
+**0.6169** (0.6199). An earlier superellipse version of this script filled
+0.6086 *and* had transparent pixels where the real icons are opaque at the
+mid-edges — which is how the error was caught, by probing the mask rather than
+eyeballing the result.
+
+Two guards now exist because the script got this wrong twice in one sitting, both
+times silently:
+
+- `resample` takes the source's channel count and raises when the buffer length
+  disagrees with it. It once hardcoded 3 and was handed the 4-channel masked
+  master, which is not an error in Python — it just walked the buffer with the
+  wrong stride and returned a short, meaningless image.
+- `self_check` inflates each PNG it just wrote and asserts the scanline length is
+  `height * (1 + width * 4)`, so a short buffer cannot be papered over by a
+  decoder that is happy to read what is there.
+
+The lesson worth keeping: a preview that *looks* like the artwork is not evidence
+that the mask is right. Both bugs survived an "it looks fine" inspection, and both
+were caught by measuring the output — mid-edge widths and area fill — against the
+system icons.
 
 ## Verified
 
@@ -457,7 +502,7 @@ Everything below was exercised against a real DSH install on macOS 26 (arm64):
 
 | Part | Evidence |
 |---|---|
-| Builds | `cargo build` clean, zero warnings, 112 tests passing |
+| Builds | `cargo build` clean, zero warnings, 122 tests passing |
 | Window | Hidden titlebar, inset traffic lights, drag strip |
 | Renders DSH | Full web UI — sidebar, conversations, composer, cost meter |
 | Host supervision | Spawns `dsh web --no-open`, parses its authenticated URL |
@@ -473,6 +518,7 @@ Everything below was exercised against a real DSH install on macOS 26 (arm64):
 | **Handoff raises** | Window minimized → second launch → un-minimized, not merely focused |
 | **Window state** | Resized to 1000×640 at (300, 120), `kill -9`'d, relaunched at exactly that rectangle |
 | **Dock reopen** | Window minimized → `open -a` (the reopen event) → `AXMinimized` `true` → `false` |
+| **App icon** | All ten `.icns` sizes re-decoded through CoreGraphics: alpha corners `0`, mid-edge runs exactly 412/512 and 824/1024, area fill 0.6169 against the system icons' 0.6173 |
 | **Notifications** | A banner appeared with the shell's title, body, and whale icon; the previous backend delivered nothing at all |
 
 ## Known gaps
@@ -621,3 +667,8 @@ something that measures pixels.
 
 MIT. The DeepSeek icon (`assets/deepseek.svg`) comes from the official
 `@deepseek-ai/dsh-web-frontend` package and remains under its own terms.
+
+`assets/app-icon.png` — the artwork the app icon is built from — is **not** mine
+and is not covered by the MIT grant. It is a crop of someone else's illustration,
+kept in the repository only as the icon's source so `scripts/make-icon.py` can be
+re-run; drop in your own 1024×1024 PNG and regenerate if you fork this.
