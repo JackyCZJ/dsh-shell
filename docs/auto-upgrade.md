@@ -104,24 +104,78 @@ Notes that matter:
   and no npm is found, the feature reports "cannot upgrade automatically" rather
   than failing at the last step.
 
-### Why this belongs in the shell, not a plugin
+### Where the code lives, and why
 
-A DSH plugin is the idiomatic place for DSH features, and a `dsh-plugin-updater`
-would inherit settings handling and the UI event bus for free. It is still the
-wrong place: **the upgrade path must not depend on the thing it is repairing.**
-If a DSH release breaks the profile — and the bridge plugin is already version
-sensitive — then the shell, which is a separate signed binary that always starts
-regardless, is precisely the component that can still fix it. So the mechanism
-lives in `src/` in Rust, and the plugin (if any) only relays UI intent.
+The *mechanism* belongs in the shell; the *UI* belongs in DSH. That split is
+deliberate rather than a compromise:
+
+- The upgrade path must not depend on the thing it is repairing. If a DSH release
+  breaks the profile — and the bridge plugin is already version sensitive — then
+  the shell, a separate signed binary that always starts, is precisely the
+  component that can still fix it. So `src/updater.rs` stays in Rust.
+- A settings window the shell draws itself is a second UI in an app that already
+  has one, and it showed: the update section sat in a window that looked nothing
+  like DSH's own settings. So the DSH-facing UI is a client plugin, rendered
+  inside DSH's General settings.
+
+Both exist. The shell window keeps its Updates section as the fallback — it is
+the one that still works when DSH will not start — and the plugin row is the one
+a user actually sees.
+
+### How the plugin half talks to the shell
+
+The bridge plugin is plain JavaScript, and DSH's `ctx.remote.<service>` surface is
+generated from TypeScript decorators into a `typert.remote-client` module. A
+plugin with no build step therefore **cannot** expose a remote service, which is
+why the row does not call `ctx.remote.desktopShell`.
+
+It uses an HTTP route on `ctx.webServer` instead:
+
+```
+GET  /dsh-shell-update/status    the last published status
+POST /dsh-shell-update/check     forward a check to the shell, return the result
+POST /dsh-shell-update/install   forward an install request
+```
+
+Three properties make that the right seam:
+
+- It is same-origin with the page, so the browser half is a plain `fetch`.
+- Route matching is longest-prefix, so the route wins over the authenticated
+  fallback that serves the app, without needing a session token.
+- The shell's socket reply carries only `ok` and an error string. Rather than
+  widen that protocol for one caller, the shell *publishes* its status to
+  `$DSH_HOME/cache/dsh-shell/status.json` and the plugin reads it. That file is
+  an output and the registry cache is an input, and they are separate paths
+  because sharing one silently destroyed the cache on every publish.
+
+The client bundle is hand-written (`lib/client.js`), which works because DSH
+resolves a package's `./client` export directly: there is no build pipeline to
+miss for a `link:`-installed plugin.
+
+### Verifying the two halves separately
+
+`curl` covers the route, and is worth doing before touching any UI:
+
+```sh
+curl -s localhost:PORT/dsh-shell-update/status
+curl -s -X POST localhost:PORT/dsh-shell-update/check
+```
+
+The client bundle is checked by executing it against a fake module loader and a
+fake slot registry (`test/client.test.mjs`). That catches a bundle which never
+registers, or registers under the wrong slot — whose only symptom otherwise is a
+settings page that silently shows nothing.
 
 ### What the user sees
 
-- Settings window: current version, latest version, channel, "Check now",
-  "Upgrade", and — after an apply — "Restart to finish".
-- Tray menu: "Check for Updates…" plus a disabled current-version row, matching
-  macOS convention.
-- Never a silent install. This project's own release flow publishes RCs, so an
-  unattended auto-apply could move someone onto a broken prerelease overnight.
+- DSH's own General settings: the installed DSH version, the channel, a
+  "Check Now" button, and an "Upgrade to X" button when one exists.
+- The shell's settings window: the same, as the fallback when DSH will not start.
+- The tray menu: "Check for DSH Updates…" plus a row showing the version or the
+  available update.
+- Never a silent install. This project's own release flow publishes release
+  candidates, so an unattended apply could move someone onto a broken prerelease
+  overnight.
 
 ## Phases
 

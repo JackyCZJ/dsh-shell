@@ -357,6 +357,20 @@ fn run_with_timeout_hinted(
     if let Some(hint) = path_hint {
         crate::server::augment_path_for_std(&mut command, &hint.to_string_lossy());
     }
+    drive_to_exit(command, program, timeout)
+}
+
+/// Spawn a prepared command, drain it, and report its stdout.
+///
+/// Shared by both runners so that the deadlock fix below exists in exactly one
+/// place: polling `try_wait` while the child writes into a `piped` stdout
+/// deadlocks as soon as the child fills the pipe buffer, so a thread must always
+/// be reading.
+fn drive_to_exit(
+    mut command: std::process::Command,
+    program: &Path,
+    timeout: std::time::Duration,
+) -> Result<String, String> {
     let mut child = command
         .spawn()
         .map_err(|err| format!("could not run {}: {err}", program.display()))?;
@@ -551,9 +565,37 @@ fn fetch_registry(timeout: std::time::Duration) -> Result<Registry, String> {
 
 // -------------------------------------------------------------- cached state
 
-/// Where the cached registry answer lives. Written beside the shell's log.
+/// Where the cached *registry answer* lives. Written beside the shell's log.
 pub fn cache_path() -> Option<PathBuf> {
-    crate::logfile::path().map(|log| log.with_file_name("update.json"))
+    crate::logfile::path().map(|log| log.with_file_name("registry.json"))
+}
+
+/// Where the current *status* is published for other readers.
+///
+/// Deliberately not the same file as the registry cache: one is an input to the
+/// updater and the other is its output, and sharing a path meant publishing the
+/// status silently destroyed the cache — turning every later launch into the
+/// network round trip the cache exists to avoid.
+pub fn status_path() -> Option<PathBuf> {
+    crate::logfile::path().map(|log| log.with_file_name("status.json"))
+}
+
+/// Publish `status` where anything else can read it.
+///
+/// The plugin bridge's reply carries only a boolean and an error string, so it
+/// has no room for a payload; this file is how the plugin learns the result of a
+/// check without the wire protocol growing a second shape.
+pub fn publish(status: &Status) {
+    let Some(path) = status_path() else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(err) = std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&status.json()).unwrap_or_else(|_| "{}".into()),
+    ) {
+        tracing::warn!(%err, "could not publish the update status");
+    }
 }
 
 /// Persisted check result, so a launch is never delayed by the network.
@@ -1486,51 +1528,46 @@ mod tests {
 
     // ------------------------------------------------- the PATH the GUI lacks
 
-    /// Serialises the tests that mutate `PATH`/`HOME`, which are process-wide.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
-    fn a_launcher_needing_node_is_found_through_the_launcher_directory() {
-        // The real failure this guards: a Finder-launched app has launchd's PATH
-        // (no `node`), and `dsh` is a `#!/usr/bin/env node` script, so the probe
-        // died with exit 127 and "env: node: No such file or directory" while
-        // the install was perfectly healthy.
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-        let root = tempdir::TempDir::new("dsh-path-test");
-        let bin = root.path().join("bin");
-        let home = root.path().join("home");
-        std::fs::create_dir_all(&bin).unwrap();
-        std::fs::create_dir_all(&home).unwrap();
-
-        // A stand-in for `node` that identifies itself, and a launcher that goes
-        // through `env`, exactly as the shipped shim does.
-        write_script(&bin.join("node"), "#!/bin/sh\necho 7.7.7-rc.1\n");
-        let launcher = bin.join("dsh");
-        write_script(&launcher, "#!/usr/bin/env node\n");
-
-        // A GUI app's PATH, and a HOME with no node in it either, so the
-        // launcher's own directory is the only way through.
-        let saved_path = std::env::var_os("PATH");
-        let saved_home = std::env::var_os("HOME");
-        std::env::set_var("PATH", "/usr/bin:/bin");
-        std::env::set_var("HOME", &home);
-
-        let result = version_of(&launcher);
-
-        if let Some(value) = saved_path {
-            std::env::set_var("PATH", value);
-        } else {
-            std::env::remove_var("PATH");
-        }
-        if let Some(value) = saved_home {
-            std::env::set_var("HOME", value);
-        } else {
-            std::env::remove_var("HOME");
-        }
-
+    fn the_launcher_directory_comes_first_on_the_augmented_path() {
+        // The bug this guards: a Finder-launched app inherits launchd's PATH,
+        // which has no `node`, and `dsh` is a `#!/usr/bin/env node` script — so
+        // the probe died with exit 127, "env: node: No such file or directory",
+        // and reported a healthy install as broken.
+        //
+        // Asserted on the pure PATH builder, which reads and writes nothing
+        // global. A spawn-based version of this test was written first and
+        // removed: it needed the child to resolve `env node`, and the only
+        // faithful way to arrange that was to rewrite the process environment,
+        // which races every other test that spawns a subprocess. The runtime
+        // behaviour is covered where it is actually reachable — the isolated
+        // host probe and the installed app both report their version.
+        let path = crate::server::path_with_node_list(
+            "/opt/custom/bin/dsh",
+            "/usr/bin:/bin".to_string(),
+            None,
+        );
         assert_eq!(
-            result.expect("the launcher should have found node on the augmented PATH"),
-            v("7.7.7-rc.1")
+            path, "/opt/custom/bin:/usr/bin:/bin",
+            "the launcher's own directory must be prepended"
+        );
+
+        // A `node` found elsewhere is added too, without displacing the launcher.
+        let path = crate::server::path_with_node_list(
+            "/opt/custom/bin/dsh",
+            "/usr/bin:/bin".to_string(),
+            Some(PathBuf::from("/hermes/node/bin/node")),
+        );
+        let parts: Vec<&str> = path.split(':').collect();
+        assert_eq!(parts[0], "/opt/custom/bin");
+        assert_eq!(parts[1], "/hermes/node/bin");
+        assert!(parts.contains(&"/usr/bin"), "the existing PATH must survive");
+
+        // An empty existing PATH must not leave a leading colon, which would put
+        // the working directory on the search path.
+        assert_eq!(
+            crate::server::path_with_node_list("/opt/bin/dsh", String::new(), None),
+            "/opt/bin"
         );
     }
 

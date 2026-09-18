@@ -42,6 +42,18 @@ pub enum ShellRequest {
         #[serde(default)]
         text: Option<String>,
     },
+    /// Ask the updater to look for a newer DSH, then read the cached status.
+    ///
+    /// The reply only says whether the check ran; the result is read back from
+    /// the status file, which is the one home of update state. That keeps this
+    /// protocol's reply shape (a boolean and an error string) unchanged instead
+    /// of growing a payload channel for one caller.
+    CheckUpdate,
+    /// Stage, verify and apply the newest DSH on the configured channel.
+    ///
+    /// Deliberately not the same as the settings window's button: this is for a
+    /// caller that is watching the result itself.
+    InstallUpdate,
 }
 
 /// A reply to a `ShellRequest`.
@@ -484,6 +496,35 @@ mod tests {
         // Status changes are frequent; notifying on them would be noise.
         assert!(!notify("status"));
         assert!(!notify("created"));
+    }
+
+    #[test]
+    fn parses_the_update_requests_a_plugin_sends() {
+        // The plugin UI drives the same updater the settings window does, so
+        // these two verbs have to survive the wire — a typo here would leave a
+        // button that silently does nothing.
+        for (line, expected) in [
+            (
+                r#"{"id":"7","method":"checkUpdate"}"#,
+                "checkUpdate",
+            ),
+            (
+                r#"{"id":"8","method":"installUpdate"}"#,
+                "installUpdate",
+            ),
+        ] {
+            match parse_incoming(line) {
+                Some(Incoming::Request { request, .. }) => {
+                    let actual = match request {
+                        ShellRequest::CheckUpdate => "checkUpdate",
+                        ShellRequest::InstallUpdate => "installUpdate",
+                        other => panic!("expected an update request, got {other:?}"),
+                    };
+                    assert_eq!(actual, expected);
+                }
+                other => panic!("expected a request, got {other:?}"),
+            }
+        }
     }
 
     #[test]

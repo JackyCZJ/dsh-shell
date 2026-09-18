@@ -1,9 +1,18 @@
 {
   "name": "dsh-plugin-shell-bridge",
   "version": "0.1.0",
-  "description": "Host plugin that forwards DSH agent events to the native dsh-shell desktop shell",
+  "description": "Host plugin that forwards DSH agent events to the native dsh-shell desktop shell, and renders its DSH update section",
   "type": "module",
   "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
   "license": "MIT",
   "files": [
     "lib",
@@ -13,6 +22,13 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-slots"
+      ]
     }
   },
   "scripts": {

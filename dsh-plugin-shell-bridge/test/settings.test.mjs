@@ -183,7 +183,13 @@ test('apply registers the dsh-shell section through installSection', () => {
   const { ctx, record } = fakeContext({ settings: fakeSettings(settingsRecord) })
   apply(ctx)
   try {
-    assert.equal(record.injected[0]?.[0], 'settings', 'settings must be optional-injected')
+    // Membership, not order: the plugin injects other optional services too
+    // (the web server, for the update route), and an order-sensitive assertion
+    // turns adding one into a failure that says nothing about settings.
+    assert.ok(
+      record.injected.some((names) => names.includes('settings')),
+      `settings must be optional-injected; injected: ${JSON.stringify(record.injected)}`,
+    )
     assert.equal(settingsRecord.installs.length, 1, 'expected exactly one registered section')
     assert.equal(settingsRecord.installs[0].ns, 'dsh-shell')
     assert.deepEqual(

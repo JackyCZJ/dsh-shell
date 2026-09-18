@@ -599,6 +599,10 @@ fn main() {
         // menu, both of which are main-thread-only.
         while let Ok(status) = update_rx.try_recv() {
             update_status = status;
+            // Publish before rendering: the plugin bridge reads this file, and a
+            // reader that asks while the settings window is closed must still
+            // get the current answer.
+            updater::publish(&update_status);
             push_update_status(&settings_window, &update_status);
             if let Some(active) = tray.as_mut() {
                 active.set_update(&update_status);
@@ -719,6 +723,20 @@ fn main() {
                             }
                         }
                     }
+                }
+                bridge::ShellRequest::CheckUpdate => {
+                    request_update_check(&update_tx, &mut update_status, true);
+                }
+                bridge::ShellRequest::InstallUpdate => {
+                    // Same path the settings window's button takes, so the
+                    // plugin surface cannot install something the shell would
+                    // have refused to install for itself.
+                    request_update_install(
+                        &update_tx,
+                        &mut update_status,
+                        launcher.clone(),
+                        &theme_source,
+                    );
                 }
             }
         }

@@ -106,15 +106,22 @@ pub fn augment_path_for(cmd: &mut Command, launcher: &str) {
 
 /// The same PATH, for a synchronous `std::process::Command`.
 ///
-/// The computation is shared rather than duplicated: the two callers must agree
-/// on where `node` is, or one of them works and the other reports a healthy
-/// install as broken.
+/// As [`augment_path_for`], for the updater's probes.
 pub fn augment_path_for_std(cmd: &mut std::process::Command, launcher: &str) {
     cmd.env("PATH", path_with_node(launcher));
 }
 
 /// PATH with the launcher's directory and any nearby `node` prepended.
 pub fn path_with_node(launcher: &str) -> String {
+    path_with_node_list(launcher, std::env::var("PATH").unwrap_or_default(), which_node())
+}
+
+/// As [`path_with_node`], with the environment supplied by the caller.
+///
+/// Pure on purpose: it touches nothing global. Tests share one process across
+/// parallel threads, so a version that read the environment could not be tested
+/// without rewriting state that every other test depends on.
+pub fn path_with_node_list(launcher: &str, existing: String, node: Option<PathBuf>) -> String {
     let mut prepend: Vec<PathBuf> = Vec::new();
 
     // The directory holding the launcher usually holds `node` too: bun, volta,
@@ -124,13 +131,12 @@ pub fn path_with_node(launcher: &str) -> String {
     }
 
     // `node` may also live elsewhere; add its directory so `env node` resolves.
-    if let Some(node) = which_node() {
+    if let Some(node) = node {
         if let Some(dir) = node.parent() {
             prepend.push(dir.to_path_buf());
         }
     }
 
-    let existing = std::env::var("PATH").unwrap_or_default();
     let mut parts: Vec<String> = prepend
         .into_iter()
         .map(|p| p.to_string_lossy().into_owned())
@@ -144,8 +150,8 @@ pub fn path_with_node(launcher: &str) -> String {
         .join(":")
 }
 
-/// Find a `node` binary in the usual places.
-fn which_node() -> Option<PathBuf> {
+/// Find a `node` binary in the usual places, or on PATH.
+pub fn which_node() -> Option<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
     for rel in [
         ".local/bin/node",
@@ -168,6 +174,16 @@ fn which_node() -> Option<PathBuf> {
                 }
             }
         }
+    }
+    // Finally PATH, which is what a terminal-launched run has and a
+    // Finder-launched one does not.
+    let probe = std::process::Command::new("node")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    if matches!(probe, Ok(status) if status.success()) {
+        return Some(PathBuf::from("node"));
     }
     None
 }

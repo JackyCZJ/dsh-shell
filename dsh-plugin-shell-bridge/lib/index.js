@@ -56,6 +56,47 @@ export function socketPath(env = process.env) {
 }
 
 /**
+ * Resolve the file the shell publishes its update status to.
+ *
+ * Mirrors `logfile::path_from` in the shell: `DSH_SHELL_LOG` names the log, and
+ * the status sits beside it; otherwise the path is `$DSH_HOME` (or `~/.dsh`)
+ * under `cache/dsh-shell/`. Getting this wrong surfaces as "no update status
+ * has been published", which is why the shell also logs nothing here — the two
+ * paths either agree or the feature quietly does nothing.
+ *
+ * @param {NodeJS.ProcessEnv} env - environment to read.
+ * @returns {string | undefined} the status path, when one can be derived.
+ */
+export function updateStatusPath(env = process.env) {
+  const explicit = env.DSH_SHELL_LOG
+  if (explicit && explicit.trim() !== '') {
+    return path.join(path.dirname(explicit), 'status.json')
+  }
+  const home = env.DSH_HOME?.trim() ? env.DSH_HOME : env.HOME ? path.join(env.HOME, '.dsh') : undefined
+  if (!home) return undefined
+  return path.join(home, 'cache', 'dsh-shell', 'status.json')
+}
+
+/**
+ * Read the published update status.
+ *
+ * A missing or unreadable file is not an error worth throwing: it means the
+ * shell has not checked yet, and the caller renders "not checked".
+ *
+ * @param {NodeJS.ProcessEnv} env - environment to read.
+ * @returns {object | undefined} the status object, when one is readable.
+ */
+export function readUpdateStatus(env = process.env) {
+  const file = updateStatusPath(env)
+  if (file === undefined) return undefined
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'))
+  } catch {
+    return undefined
+  }
+}
+
+/**
  * The session id an agent event carries.
  *
  * Every agent-subject event is dispatched through a fused carrier that injects
@@ -159,6 +200,14 @@ function isPlainObject(value) {
  * `desktopShell` follows the convention the official desktop app uses for its
  * own capabilities (`desktopProfiles`, `desktopPnpm`).
  */
+/**
+ * The path the browser half of this plugin calls.
+ *
+ * A single prefix with three actions beneath it, so the route table gains one
+ * entry per install rather than three that must stay in step.
+ */
+export const UPDATE_ROUTE = '/dsh-shell-update'
+
 export const SERVICE_NAME = 'desktopShell'
 
 /**
@@ -200,6 +249,8 @@ export const ShellMethod = {
   HideWindow: 'hideWindow',
   SetStatusLabel: 'setStatusLabel',
   SetConfig: 'setConfig',
+  CheckUpdate: 'checkUpdate',
+  InstallUpdate: 'installUpdate',
 }
 
 /**
@@ -673,6 +724,101 @@ function createShellService(link) {
     hideWindow: () => call(ShellMethod.HideWindow),
     /** Set or clear the short label shown beside the agent state. */
     setStatusLabel: (text) => call(ShellMethod.SetStatusLabel, { text }),
+    /**
+     * Ask the shell to look for a newer DSH and report what it found.
+     *
+     * The reply carries only success or an error, so the result is read back
+     * from the status file the shell publishes. That is deliberate: the shell
+     * owns what counts as a newer version (its comparison knows prerelease
+     * ordering), and duplicating that judgement here would let the two disagree
+     * about whether an upgrade is available.
+     *
+     * @returns {Promise<{ok: boolean, status?: object, error?: string}>}
+     */
+    checkUpdate: async () => {
+      const reply = await call(ShellMethod.CheckUpdate)
+      if (!reply.ok) return reply
+      const status = readUpdateStatus()
+      return status === undefined
+        ? { ok: false, error: 'the shell published no update status' }
+        : { ok: true, status }
+    },
+    /**
+     * Ask the shell to stage, verify and install the newer DSH.
+     *
+     * Resolves as soon as the shell accepts the request, not when the install
+     * finishes: the install replaces the DSH that is running this plugin, so a
+     * caller that waited for completion would be waiting on its own host being
+     * torn down. Poll {@link checkUpdate} for progress.
+     */
+    installUpdate: () => call(ShellMethod.InstallUpdate),
+    /**
+     * The last status the shell published, without asking for a new check.
+     *
+     * @returns {{ok: boolean, status?: object, error?: string}}
+     */
+    updateStatus: () => {
+      const status = readUpdateStatus()
+      return status === undefined
+        ? { ok: false, error: 'no update status has been published' }
+        : { ok: true, status }
+    },
+  }
+}
+
+/**
+ * Build the update route the browser half calls.
+ *
+ * Extracted from `apply` so the request handling can be tested by calling it
+ * with a fake response, rather than only by booting a host and driving a
+ * browser.
+ *
+ * Unauthenticated on purpose, and safe to be: `ctx.webServer` binds loopback,
+ * and every action here is equivalent to something any local process could
+ * already do — install a published DSH, or read a version string.
+ *
+ * @param {ReturnType<typeof createShellService>} shell - the shell service.
+ * @returns {{kind: string, path: string, handler: Function}} a route.
+ */
+export function createUpdateRoute(shell) {
+  return {
+    kind: 'prefix',
+    path: UPDATE_ROUTE,
+    handler: async (req, res) => {
+      const pathname = new URL(req.url ?? '/', 'http://x').pathname
+      const action = pathname.slice(UPDATE_ROUTE.length).replace(/^\/+/, '')
+      const send = (status, body) => {
+        const text = JSON.stringify(body)
+        res.writeHead(status, {
+          'content-type': 'application/json',
+          'content-length': Buffer.byteLength(text),
+          // The status changes under the reader's feet; a cached copy would
+          // show a phase that has already moved on.
+          'cache-control': 'no-store',
+        })
+        res.end(text)
+      }
+
+      try {
+        if (action === 'status' && req.method === 'GET') {
+          // `status` may legitimately be undefined before the shell has
+          // checked; the page shows "not checked" for that, so it is a 200.
+          return send(200, { ok: true, status: readUpdateStatus() ?? null })
+        }
+        if (action === 'check' && req.method === 'POST') {
+          return send(200, await shell.checkUpdate())
+        }
+        if (action === 'install' && req.method === 'POST') {
+          // Deliberately not awaited to completion: the install replaces the
+          // running host, so waiting would be waiting on this process dying.
+          return send(200, await shell.installUpdate())
+        }
+        return send(404, { ok: false, error: `no such action: ${action}` })
+      } catch (error) {
+        // This surface must never take the host down with it.
+        return send(500, { ok: false, error: error?.message ?? String(error) })
+      }
+    },
   }
 }
 
@@ -696,7 +842,30 @@ export function apply(ctx) {
 
   // Publish the shell service. Consumers declare `inject: [SERVICE_NAME]` and
   // then call `ctx.desktopShell.*`.
-  ctx.provide(SERVICE_NAME, createShellService(link))
+  const shellService = createShellService(link)
+  ctx.provide(SERVICE_NAME, shellService)
+
+  // A small HTTP surface for the browser half of this plugin.
+  //
+  // Not `ctx.remote.desktopShell`: the Remote surface is generated from
+  // TypeScript decorators into a `typert.remote-client` module, which a plain
+  // JavaScript plugin cannot produce. An HTTP route reaches the same service
+  // with no code generation, and is same-origin with the page that calls it.
+  //
+  // Every step is optional: a host without a web server, or a context whose
+  // scope cannot register effects, loses this surface and nothing else. The
+  // plugin's whole contract is that DSH boots identically whether or not this
+  // is here.
+  ctx.inject(['webServer'], (webCtx) => {
+    const webServer = webCtx.webServer
+    if (webServer === undefined || typeof webServer.register !== 'function') return
+    const route = createUpdateRoute(shellService)
+    if (typeof webCtx.effect === 'function') {
+      webCtx.effect(() => webServer.register(route), 'shell-bridge: update route')
+    } else {
+      webServer.register(route)
+    }
+  })
 
   // Agent lifecycle and status drive the tray icon.
   for (const [event, kind] of [

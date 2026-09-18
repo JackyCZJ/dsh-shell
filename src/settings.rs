@@ -160,22 +160,39 @@ mod tests {
 
     /// The page's script, as the browser would parse it.
     ///
-    /// `node --check` is the only JavaScript parser this project can reach
-    /// without a browser or a dependency, and it is a real one — it caught the
+    /// `node --check` is the only real JavaScript parser this project can reach
+    /// without a browser or a dependency, and it earns its place: it caught the
     /// update status being injected as a JSON-encoded *string* rather than an
     /// object, which no string assertion here would have noticed.
+    ///
+    /// `node` is resolved to an absolute path rather than taken from `PATH`.
+    /// Tests run in parallel in one process, and a test that rewrites `PATH` —
+    /// the one pinning that a GUI app has no node on it, which must — otherwise
+    /// makes this one fail for a reason that has nothing to do with the page.
     fn assert_page_script_parses(html: &str) {
         let start = html.find("<script>").expect("the page has a script block");
         let body = &html[start + "<script>".len()..];
         let end = body.find("</script>").expect("the script block is closed");
         let script = &body[..end];
 
+        let Some(node) = crate::server::which_node() else {
+            eprintln!("no node found; skipping the script parse check");
+            return;
+        };
+
+        // Unique per call, not per process: the tests run in parallel threads of
+        // one process, and a shared path meant two of them wrote this file at
+        // once — so `node --check` sometimes parsed a half-written script and
+        // reported a syntax error that was really a race.
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("dsh-settings-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create temp dir");
-        let path = dir.join("settings.js");
+        let path = dir.join(format!("settings-{seq}.js"));
         std::fs::write(&path, script).expect("write the extracted script");
 
-        let output = std::process::Command::new("node")
+        let output = std::process::Command::new(&node)
             .arg("--check")
             .arg(&path)
             .output();
@@ -187,8 +204,8 @@ mod tests {
                 "the settings script does not parse:\n{}",
                 String::from_utf8_lossy(&output.stderr)
             ),
-            // No node on this machine; the check is skipped rather than failed.
-            Err(_) => eprintln!("node not found; skipping the script parse check"),
+            // Raced with something that removed it; not this test's business.
+            Err(_) => eprintln!("could not run {}; skipping", node.display()),
         }
     }
 
