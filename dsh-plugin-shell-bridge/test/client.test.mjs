@@ -129,11 +129,17 @@ test('applying the bundle registers dictionaries and one settings row', () => {
 	// The row goes into the General section's declared child slot, which is what
 	// makes it appear inside DSH's own settings rather than in a window of ours.
 	const inject = calls.find((call) => call.kind === 'inject')
-	assert.equal(inject?.name, 'settings.general.item')
+	assert.equal(
+		inject?.name,
+		'settings.section',
+		'this configuration is its own section, not a row inside General',
+	)
 
 	const registration = calls.find((call) => call.kind === 'register')
-	assert.equal(registration?.options.name, 'settings.general.item')
-	assert.equal(registration?.options.id, 'shell-updates', 'a list slot needs an id')
+	assert.equal(registration?.options.name, 'settings.section')
+	assert.equal(registration?.options.id, 'shell', 'a list slot needs an id')
+	assert.equal(typeof registration?.options.label, 'function', 'the nav entry needs a label')
+	assert.equal(typeof registration?.options.order, 'number', 'or it lands wherever')
 	assert.equal(typeof registration?.component, 'function')
 })
 
@@ -175,7 +181,7 @@ function mountRow() {
 	exports.apply(ctx)
 	// Rendered without a renderer: this is about whether the component body runs
 	// at all, which is where a typo in a field name or hook order shows up.
-	return exports.UpdateSection({ renderSlot: () => null })
+	return exports.ShellSettingsSection({})
 }
 
 test('the settings row mounts without throwing', () => {
@@ -184,19 +190,17 @@ test('the settings row mounts without throwing', () => {
 	assert.ok(Array.isArray(tree.props.children), 'the row composes several children')
 })
 
-test('mounting does not lose the child slot', async () => {
-	// The General section declares `settings.general.item` as a child slot.
-	// Failing to render it would silently remove every other plugin's row.
+test('the section registers itself and nothing into General', async () => {
+	// It used to register a row into `settings.general.item`. Moving to its own
+	// section must *stop* doing that, or the configuration would appear twice:
+	// once under General and once under its own tab.
 	const module = loadBundle()
 	const exports = module.factory(fakeRequire)
-	const { ctx } = fakeContext()
+	const { ctx, calls } = fakeContext()
 	exports.apply(ctx)
-	let rendered = 0
-	exports.UpdateSection({ renderSlot: () => {
-		rendered += 1
-		return null
-	} })
-	assert.equal(rendered, 1, 'renderSlot must be called exactly once')
+	const injected = calls.filter((call) => call.kind === 'inject').map((call) => call.name)
+	assert.ok(!injected.includes('settings.general.item'), 'General must be left alone')
+	assert.ok(injected.includes('settings.section'))
 })
 
 test('the diff sends only what changed', () => {

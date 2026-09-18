@@ -173,6 +173,15 @@ whole shell configuration, so the plugin also renders the appearance and shortcu
 form: the summon shortcut, both palettes, the custom CSS, and the upgrade
 channel. The shell's own settings window keeps all of it as the fallback.
 
+It is registered as its **own section** (`settings.section`, id `shell`), so it
+gets a navigation entry beside General, Models and Plugins rather than a row
+inside General. That is how the official sections appear, and it keeps DSH's own
+preferences and the shell's from reading as one list. The nav icon is left
+undeclared on purpose: the dialog picks one by section id and falls back to a
+settings cog for an id it does not know, whereas borrowing an official icon means
+importing a platform seed whose exports a hand-written bundle cannot verify — and
+a wrong name there fails the entire page.
+
 Two endpoints carry it, on the same route:
 
 ```

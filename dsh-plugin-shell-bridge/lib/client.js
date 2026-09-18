@@ -52,7 +52,8 @@ window.__ModuleLoader__.load({
 			'noShell': '桌面 shell 未连接，无法升级。',
 			'channel': '通道：{channel}',
 
-			'config.title': 'DSH Shell 外观与快捷键',
+			'section.title': 'DSH Shell',
+			'config.title': '外观与快捷键',
 			'config.hint': '改动会立即生效，无需重启。',
 			'config.hotkey': '唤起快捷键',
 			'config.hotkeyHint': '至少需要一个修饰键，例如 meta+shift+D。',
@@ -94,7 +95,8 @@ window.__ModuleLoader__.load({
 			'noShell': 'No desktop shell is connected, so it cannot upgrade.',
 			'channel': 'Channel: {channel}',
 
-			'config.title': 'DSH Shell appearance and shortcut',
+			'section.title': 'DSH Shell',
+			'config.title': 'Appearance and shortcut',
 			'config.hint': 'Changes apply immediately; no restart.',
 			'config.hotkey': 'Summon shortcut',
 			'config.hotkeyHint': 'At least one modifier is required, e.g. meta+shift+D.',
@@ -455,14 +457,18 @@ window.__ModuleLoader__.load({
 		 *
 		 * @returns the row element tree.
 		 */
-		function UpdateSection({ renderSlot }) {
-			const children = [jsx.jsx(ConfigSection, {}, 'config'), UpdateRow()]
-			// The section declares `settings.general.item` as a child slot; render
-			// it or every other plugin's row in this section disappears.
-			if (typeof renderSlot === 'function') {
-				children.push(renderSlot('settings.general.item', {}))
-			}
-			return jsx.jsx('div', { className: 'dsh-shell-row', children })
+		function ShellSettingsSection() {
+			// A section of its own rather than a row inside General: the shell's
+			// configuration is its own subject, and burying it under General made
+			// DSH's general preferences and the shell's look like one list.
+			//
+			// No `renderSlot` passthrough here: this section declares no child
+			// slots, so there is nothing to pass through. The General section's
+			// child slot is no longer ours.
+			return jsx.jsx('div', {
+				className: 'dsh-shell-section',
+				children: [jsx.jsx(ConfigSection, {}, 'config'), UpdateRow()],
+			})
 		}
 
 		/**
@@ -613,13 +619,13 @@ window.__ModuleLoader__.load({
 		 * properties so the row follows the theme like everything around it.
 		 */
 		const CSS = `
-.dsh-shell-row { display: flex; flex-direction: column; gap: 18px; }
+.dsh-shell-section { display: flex; flex-direction: column; gap: 22px; max-width: 720px; }
 .dsh-shell-subhead { font-weight: 600; margin-bottom: 6px; }
-.dsh-shell-config { display: flex; flex-direction: column; gap: 12px; }
+.dsh-shell-config { display: flex; flex-direction: column; gap: 16px; }
 .dsh-shell-config-head { border-bottom: 1px solid var(--dsh-border, rgba(128,128,128,.2)); padding-bottom: 8px; }
-.dsh-shell-field { display: flex; gap: 16px; align-items: flex-start; }
-.dsh-shell-field-label { flex: 0 0 148px; }
-.dsh-shell-field-body { flex: 1; display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.dsh-shell-field { display: flex; flex-direction: column; gap: 6px; }
+.dsh-shell-field-label { font-weight: 500; }
+.dsh-shell-field-body { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
 .dsh-shell-field input[type=text], .dsh-shell-field textarea {
   font: inherit; width: 100%; box-sizing: border-box; padding: 5px 8px;
   border-radius: 6px; border: 1px solid var(--dsh-border, rgba(128,128,128,.35));
@@ -632,9 +638,9 @@ window.__ModuleLoader__.load({
 .dsh-shell-colour input[type=color] { width: 32px; height: 22px; padding: 0; border: 1px solid var(--dsh-border, rgba(128,128,128,.35)); border-radius: 4px; background: none; }
 .dsh-shell-colour code { font-size: 11px; opacity: .7; }
 .dsh-shell-config-actions { display: flex; align-items: center; gap: 8px; }
-.dsh-shell-update-row { display: flex; gap: 16px; padding-top: 12px; border-top: 1px solid var(--dsh-border, rgba(128,128,128,.2)); }
-.dsh-shell-update-label { flex: 0 0 148px; }
-.dsh-shell-update-body { flex: 1; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.dsh-shell-update-row { display: flex; flex-direction: column; gap: 6px; padding-top: 16px; border-top: 1px solid var(--dsh-border, rgba(128,128,128,.2)); }
+.dsh-shell-update-label { font-weight: 500; }
+.dsh-shell-update-body { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
 .dsh-shell-update-versions { display: flex; align-items: center; gap: 10px; }
 .dsh-shell-update-versions code { font-size: 12px; }
 .dsh-shell-update-channel { font-size: 11px; opacity: .6; }
@@ -667,18 +673,30 @@ window.__ModuleLoader__.load({
 			)
 			t = ctx.locale.bind(NS)
 
-			// `settings.general.item` is declared by the General section as a
-			// list slot, so registering into it appends a row there rather than
-			// claiming a section of our own — which is what the official
-			// settings plugins do, and what makes this look native.
-			ctx.slots.inject('settings.general.item', () =>
-				ctx.slots.register({ name: 'settings.general.item', id: 'shell-updates' }, UpdateSection),
+			// The settings dialog declares `settings.section` as a list, so
+			// registering here adds a navigation entry of our own — which is what
+			// this configuration deserves, and how the official sections appear.
+			//
+			// No icon is declared: the dialog picks one by section id and falls
+			// back to a settings cog for an id it does not know. Naming one of the
+			// official icons would mean importing a platform seed whose exports
+			// this bundle cannot verify, and a wrong name fails the whole page.
+			ctx.slots.inject('settings.section', () =>
+				ctx.slots.register(
+					{
+						name: 'settings.section',
+						id: 'shell',
+						order: 20,
+						label: () => t('section.title'),
+					},
+					ShellSettingsSection,
+				),
 			)
 		}
 
 		exports.apply = apply
 		exports.inject = inject
-		exports.UpdateSection = UpdateSection
+		exports.ShellSettingsSection = ShellSettingsSection
 		// Exported for the test that executes this bundle: the diff decides which
 		// fields a save sends, and sending the wrong ones silently reverts a
 		// setting the form never showed.

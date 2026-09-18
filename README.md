@@ -49,7 +49,7 @@ runtime it was trying to avoid in the first place.
 | **Dock reopen** | Clicking the dock icon restores a hidden or minimized window |
 | **Dock badge + tray count** | Finished turns you have not looked at, as a red number on the dock icon and the same number beside the menu-bar icon; clears when the window is in front again |
 | **Upgrading the DSH it runs** | Checks the registry once per launch (cached), and on request stages, verifies and swaps in a newer DSH — rolling itself back if the new one will not start. Nothing installs without a click |
-| **The settings UI is DSH's own** | A client plugin renders the appearance, shortcut and update controls inside DSH's General settings; the shell's own window keeps them as a fallback for when DSH will not start |
+| **The settings UI is DSH's own** | A client plugin adds a section to DSH's settings dialog — appearance, shortcut, colours and updates — beside General, Models and Plugins; the shell's own window keeps them as a fallback for when DSH will not start |
 | **A readable log** | Diagnostics go to `$DSH_HOME/cache/dsh-shell/dsh-shell.log`, not to a terminal a GUI app does not have |
 | **Plugin bridge** | A real DSH Host plugin forwards `agent/*` events to the shell |
 
