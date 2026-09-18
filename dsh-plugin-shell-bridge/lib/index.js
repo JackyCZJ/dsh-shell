@@ -251,6 +251,7 @@ export const ShellMethod = {
   SetConfig: 'setConfig',
   CheckUpdate: 'checkUpdate',
   InstallUpdate: 'installUpdate',
+  OpenSettings: 'openSettings',
 }
 
 /**
@@ -745,6 +746,13 @@ function createShellService(link) {
     /** Set or clear the short label shown beside the agent state. */
     setStatusLabel: (text) => call(ShellMethod.SetStatusLabel, { text }),
     /**
+     * Open the shell's own settings window.
+     *
+     * The fallback path: DSH's settings dialog is unreachable when DSH will not
+     * start, and this window is a separate surface that always works.
+     */
+    openSettings: () => call(ShellMethod.OpenSettings),
+    /**
      * Ask the shell to look for a newer DSH and report what it found.
      *
      * The reply carries only success or an error, so the result is read back
@@ -875,6 +883,9 @@ export function createUpdateRoute(shell, config) {
           // Deliberately not awaited to completion: the install replaces the
           // running host, so waiting would be waiting on this process dying.
           return send(200, await shell.installUpdate())
+        }
+        if (action === 'shell-settings' && req.method === 'POST') {
+          return send(200, await shell.openSettings())
         }
         if (action === 'config' && req.method === 'GET') {
           if (config === undefined) {

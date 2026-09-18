@@ -341,3 +341,36 @@ test('config cannot be reached over GET with a body, nor written over a read', a
   assert.equal(res.status, 404)
   assert.equal(config.record.written.length, 0)
 })
+
+test('POST shell-settings opens the shell window through the service', async () => {
+  // The fallback path for a DSH that will not start, so it has to reach the
+  // shell rather than being handled anywhere else.
+  let opened = 0
+  const shell = {
+    checkUpdate: async () => ({ ok: true }),
+    installUpdate: async () => ({ ok: true }),
+    openSettings: async () => {
+      opened += 1
+      return { ok: true }
+    },
+  }
+  const res = await call('shell-settings', 'POST', shell)
+  assert.equal(res.status, 200)
+  assert.deepEqual(res.body, { ok: true })
+  assert.equal(opened, 1)
+})
+
+test('shell-settings is POST-only', async () => {
+  let opened = 0
+  const shell = {
+    checkUpdate: async () => ({ ok: true }),
+    installUpdate: async () => ({ ok: true }),
+    openSettings: async () => {
+      opened += 1
+      return { ok: true }
+    },
+  }
+  const res = await call('shell-settings', 'GET', shell)
+  assert.equal(res.status, 404)
+  assert.equal(opened, 0, 'a GET must not open a window')
+})

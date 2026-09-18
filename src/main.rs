@@ -520,15 +520,14 @@ fn main() {
             if let Some(active) = tray.as_ref() {
                 match native::tray_command(&event, active) {
                     Some(native::TrayCommand::Show) => summon(&window),
-                    Some(native::TrayCommand::Settings) => {
-                        open_settings(
-                            &mut settings_window,
-                            event_loop,
-                            &theme_source,
-                            &plugin_link,
-                            &settings_tx,
-                            &update_status,
-                        );
+                    Some(native::TrayCommand::DshSettings) => {
+                        // DSH's own settings dialog, on the section the bridge
+                        // plugin contributes — not the shell's own window. The
+                        // configuration lives there now, so a menu item called
+                        // "Settings" that opened a second, differently styled
+                        // window was pointing at the wrong place.
+                        summon(&window);
+                        open_dsh_settings(&webview, theme_source.locale());
                     }
                     Some(native::TrayCommand::CheckForUpdates) => {
                         request_update_check(&update_tx, &mut update_status, true);
@@ -726,6 +725,16 @@ fn main() {
                 }
                 bridge::ShellRequest::CheckUpdate => {
                     request_update_check(&update_tx, &mut update_status, true);
+                }
+                bridge::ShellRequest::OpenSettings => {
+                    open_settings(
+                        &mut settings_window,
+                        event_loop,
+                        &theme_source,
+                        &plugin_link,
+                        &settings_tx,
+                        &update_status,
+                    );
                 }
                 bridge::ShellRequest::InstallUpdate => {
                     // Same path the settings window's button takes, so the
@@ -1136,6 +1145,43 @@ fn initial_hotkey_spec(theme_source: &ThemeSource) -> native::HotkeySpec {
 struct SettingsWindow {
     window: tao::window::Window,
     webview: wry::WebView,
+}
+
+/// The script the shell injects to open its section in DSH's settings.
+///
+/// The label is embedded as a JSON string, not interpolated raw: it is
+/// localised, and a quote or a backslash in a future translation would
+/// otherwise end the string literal and break the whole script. That failure is
+/// silent — an injected script's errors go to the page console, which nobody is
+/// reading — so the escaping has its own test.
+fn dsh_settings_script(label: &str) -> String {
+    format!(
+        "window.__dshEmbeddedSettings && window.__dshEmbeddedSettings.open({});",
+        json_string(label)
+    )
+}
+
+/// Open the shell's section inside DSH's own settings dialog.
+///
+/// The shell cannot address that dialog directly: it is React state inside the
+/// page, with no URL and no native handle. So it asks the bridge plugin's own
+/// bundle to do it — the plugin registers the section, so it knows both the
+/// trigger and the section label, and keeping those selectors on that side means
+/// they cannot drift from the section they refer to.
+///
+/// The call is fire-and-forget. A page that has not loaded the bundle yet simply
+/// does nothing, which is the same outcome as the user closing the dialog, and
+/// nothing here is worth interrupting them over.
+fn open_dsh_settings(webview: &std::sync::Arc<std::sync::Mutex<wry::WebView>>, locale: crate::i18n::Locale) {
+    let script = dsh_settings_script(locale.strings().dsh_settings_section);
+    match webview.lock() {
+        Ok(wv) => {
+            if let Err(err) = wv.evaluate_script(&script) {
+                tracing::warn!(%err, "could not ask the page to open DSH settings");
+            }
+        }
+        Err(err) => tracing::warn!(%err, "webview was poisoned; cannot open DSH settings"),
+    }
 }
 
 /// Open the settings window, or bring an existing one forward.
@@ -1553,6 +1599,39 @@ fn json_string(s: &str) -> String {
 mod tests {
     use super::*;
     use theme::{ColorHex, Theme};
+
+    #[test]
+    fn the_injected_settings_script_survives_an_awkward_label() {
+        for label in [
+            "DSH Shell",
+            "DSH \"Shell\"",
+            "back\\slash",
+            "new\nline",
+            "设置",
+        ] {
+            let script = dsh_settings_script(label);
+            // The label must survive as a JSON string: parse the argument back
+            // out of the generated call and compare.
+            let start = script.find('(').expect("the call has arguments") + 1;
+            let end = script.rfind(')').expect("the call is closed");
+            let argument = &script[start..end];
+            let parsed: String = serde_json::from_str(argument)
+                .unwrap_or_else(|err| panic!("{label:?} produced unparseable JS: {err}\n{script}"));
+            assert_eq!(parsed, label);
+            // And it must not end the statement early.
+            assert!(!script.contains("\n"), "a literal newline breaks the script");
+        }
+    }
+
+    #[test]
+    fn the_localised_script_names_the_section_the_plugin_registers() {
+        // The label is matched against the nav entry the plugin registers, so
+        // these two constants have to agree or the tab is never selected.
+        for locale in [crate::i18n::Locale::En, crate::i18n::Locale::Zh] {
+            let label = locale.strings().dsh_settings_section;
+            assert!(label.contains("DSH Shell"), "{label} should name the section");
+        }
+    }
 
     #[test]
     fn css_is_embedded_as_a_safe_js_literal() {

@@ -95,7 +95,10 @@ impl Tray {
             None,
         );
         let show_item = MenuItem::new(t.show_window, true, None);
-        let settings_item = MenuItem::new(t.settings, true, None);
+        // Named for whose settings these are: the configuration lives in DSH's
+        // dialog now, and a bare "Settings…" would not say which of the two it
+        // opens.
+        let settings_item = MenuItem::new(t.dsh_settings, true, None);
         let quit_item = MenuItem::new(t.quit, true, None);
         // The version row starts blank: the tray is built before anything has
         // asked the launcher what it is, and a placeholder would be a lie.
@@ -1036,7 +1039,8 @@ fn notify_macos(summary: &str, body: &str) -> Result<(), String> {
 /// Menu events surfaced to the caller.
 pub enum TrayCommand {
     Show,
-    Settings,
+    /// Open the shell's section inside DSH's own settings dialog.
+    DshSettings,
     /// Ask the updater to look for a newer DSH.
     CheckForUpdates,
     Quit,
@@ -1047,7 +1051,7 @@ pub fn tray_command(event: &MenuEvent, tray: &Tray) -> Option<TrayCommand> {
     if event.id == *tray.show_item_id() {
         Some(TrayCommand::Show)
     } else if event.id == *tray.settings_item_id() {
-        Some(TrayCommand::Settings)
+        Some(TrayCommand::DshSettings)
     } else if event.id == *tray.update_item_id() {
         Some(TrayCommand::CheckForUpdates)
     } else if event.id == *tray.quit_item_id() {

@@ -236,6 +236,31 @@ Three things about this are worth keeping:
   a shortcut with no modifier, and a colour that is not six-digit hex, so the
   user sees why.
 
+### The tray's settings item opens DSH's dialog
+
+Once the configuration lives in DSH's own settings dialog, a tray item called
+"Settings…" that opened the shell's separate window was pointing at the wrong
+place. It now opens DSH's dialog on our section.
+
+The shell cannot address that dialog directly — it is React state inside the
+page, with no URL and no native handle — so it asks the bridge plugin's own
+bundle, which injects a call through the existing `evaluate_script` path. Keeping
+the selectors on that side is the point: the plugin registers the section, so it
+knows both the trigger and the label, and they cannot drift from the section they
+refer to. The trigger is found by `aria-haspopup="dialog"` rather than by its
+label, because the label is localised; the nav entry is found by text, scoped to
+the `<nav>` because the content pane has buttons of its own.
+
+The label crosses that boundary as a JSON string, and that has its own test: it
+is localised, and a quote or backslash in a future translation would end the
+string literal and break the script — silently, since an injected script's
+errors go to the page console that nobody is watching.
+
+The shell's own window is still reachable, and that is deliberate rather than
+leftover: it is the surface that works when DSH will not start, which is exactly
+when the page's dialog cannot be reached. It has its own `openSettings` request
+on the bridge, and a quiet link at the end of the form opens it.
+
 ### What the user sees
 
 - DSH's own General settings: the appearance/shortcut form, then the installed

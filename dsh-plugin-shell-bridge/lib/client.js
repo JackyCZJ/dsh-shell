@@ -77,6 +77,7 @@ window.__ModuleLoader__.load({
 			'config.colour.text': '文字',
 			'config.colour.textMuted': '次要文字',
 			'config.colour.accent': '强调色',
+			'config.openShell': '打开桌面窗口设置（DSH 起不来时用）',
 		}
 		const en = {
 			'title': 'DSH version',
@@ -120,6 +121,7 @@ window.__ModuleLoader__.load({
 			'config.colour.text': 'Text',
 			'config.colour.textMuted': 'Muted text',
 			'config.colour.accent': 'Accent',
+			'config.openShell': 'Open the desktop window settings (for when DSH will not start)',
 		}
 
 		/**
@@ -442,6 +444,14 @@ window.__ModuleLoader__.load({
 								},
 								children: t('config.revert'),
 							}),
+							jsx.jsx('button', {
+								type: 'button',
+								className: 'dsh-shell-link',
+								onClick: () => {
+									call('shell-settings', 'POST')
+								},
+								children: t('config.openShell'),
+							}),
 							jsx.jsx('span', {
 								className: `dsh-shell-update-message${error ? ' is-error' : ''}`,
 								children: error ?? message ?? (dirty ? t('config.unsaved') : ''),
@@ -607,6 +617,45 @@ window.__ModuleLoader__.load({
 			return jsx.jsx('div', { children })
 		}
 
+		/**
+		 * Open this section in DSH's settings dialog.
+		 *
+		 * Called by the desktop shell — which is why the selectors live here
+		 * rather than in Rust. The trigger is found by `aria-haspopup="dialog"`
+		 * rather than by its label, because the label is localised; the nav entry
+		 * is found by the text this bundle registered, so the two cannot drift.
+		 *
+		 * The dialog mounts asynchronously, so this polls briefly instead of
+		 * assuming the DOM is ready the moment the shell injects the call. It is
+		 * idempotent: if the dialog is already open it only selects the section.
+		 *
+		 * @returns {Promise<boolean>} whether the section was selected.
+		 */
+		async function openSettingsSection(label) {
+			const text = typeof label === 'string' && label !== '' ? label : t('section.title')
+			for (let attempt = 0; attempt < 40; attempt += 1) {
+				const panel = document.querySelector('[role="dialog"]')
+				if (panel === null) {
+					const trigger = document.querySelector('button[aria-haspopup="dialog"]')
+					if (trigger !== null) trigger.click()
+				} else {
+					// Scoped to the nav: section entries are the only buttons in
+					// there, whereas the content pane has its own buttons and one
+					// of them could carry the same text.
+					const nav = panel.querySelector('nav')
+					const match = [...(nav ?? panel).querySelectorAll('button')].find(
+						(node) => (node.textContent ?? '').trim() === text,
+					)
+					if (match !== undefined) {
+						match.click()
+						return true
+					}
+				}
+				await new Promise((resolve) => setTimeout(resolve, 100))
+			}
+			return false
+		}
+
 		/** Required services: the UI slot registry and the locale runtime. */
 		const inject = ['slots', 'locale']
 
@@ -731,6 +780,17 @@ window.__ModuleLoader__.load({
 .dsh-shell-config-actions button.primary:hover:not(:disabled) { filter: brightness(1.06); }
 .dsh-shell-config-actions button:disabled { opacity: .45; cursor: default; }
 .dsh-shell-config-actions .dsh-shell-update-message { margin-left: 4px; }
+/* A quiet, link-like escape hatch rather than a third button competing with
+   Save. It is for the case where DSH will not start, which is rare enough that
+   it should not draw the eye. */
+.dsh-shell-config-actions button.dsh-shell-link {
+  margin-left: auto; border: none; background: none; padding: 4px 0;
+  color: var(--dsw-alias-label-tertiary, #979da6); text-decoration: underline;
+  font-size: var(--dsw-font-xxs-12-font-size, 12px);
+}
+.dsh-shell-config-actions button.dsh-shell-link:hover {
+  background: none; color: var(--dsw-alias-label-secondary, #61666b);
+}
 
 .dsh-shell-update-row {
   display: flex; flex-direction: column; gap: 6px; padding-top: 20px;
@@ -816,6 +876,16 @@ window.__ModuleLoader__.load({
 			)
 		}
 
+		// The desktop shell's entry point: it has no way to reach the dialog
+		// directly (React state, no URL, no native handle), so it calls this.
+		// The label is passed in because the shell knows the active locale.
+		window.__dshEmbeddedSettings = {
+			open(label) {
+				const wanted = typeof label === 'string' && label !== '' ? label : t('section.title')
+				return openSettingsSection(wanted)
+			},
+		}
+
 		exports.apply = apply
 		exports.inject = inject
 		exports.ShellSettingsSection = ShellSettingsSection
@@ -824,6 +894,7 @@ window.__ModuleLoader__.load({
 		// setting the form never showed.
 		exports.diff = diff
 		exports.problem = problem
+		exports.openSettingsSection = openSettingsSection
 		return module.exports
 	},
 })

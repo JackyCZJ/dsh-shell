@@ -73,7 +73,11 @@ impl Locale {
 pub struct Strings {
     // Tray
     pub show_window: &'static str,
-    pub settings: &'static str,
+    /// The tray row that opens DSH's settings dialog, on the shell's section.
+    pub dsh_settings: &'static str,
+    /// The label of that section *inside* DSH, which the plugin registers and
+    /// this only has to name when asking the page to select it.
+    pub dsh_settings_section: &'static str,
     pub quit: &'static str,
     pub agent_prefix: &'static str,
     pub agent_idle: &'static str,
@@ -112,7 +116,8 @@ pub struct Strings {
 
 static EN: Strings = Strings {
     show_window: "Show Window",
-    settings: "Settings…",
+    dsh_settings: "DSH Settings…",
+    dsh_settings_section: "DSH Shell",
     quit: "Quit",
     agent_prefix: "Agent",
     agent_idle: "idle",
@@ -146,7 +151,8 @@ static EN: Strings = Strings {
 
 static ZH: Strings = Strings {
     show_window: "显示窗口",
-    settings: "设置…",
+    dsh_settings: "DSH 设置…",
+    dsh_settings_section: "DSH Shell",
     quit: "退出",
     agent_prefix: "代理",
     agent_idle: "空闲",

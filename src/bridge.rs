@@ -54,6 +54,12 @@ pub enum ShellRequest {
     /// Deliberately not the same as the settings window's button: this is for a
     /// caller that is watching the result itself.
     InstallUpdate,
+    /// Open the shell's own settings window.
+    ///
+    /// The fallback for a DSH that will not start: the page's own settings
+    /// dialog is unreachable then, and this window is a separate, always
+    /// available surface. Normal configuration edits do not come through here.
+    OpenSettings,
 }
 
 /// A reply to a `ShellRequest`.

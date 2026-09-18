@@ -49,7 +49,7 @@ runtime it was trying to avoid in the first place.
 | **Dock reopen** | Clicking the dock icon restores a hidden or minimized window |
 | **Dock badge + tray count** | Finished turns you have not looked at, as a red number on the dock icon and the same number beside the menu-bar icon; clears when the window is in front again |
 | **Upgrading the DSH it runs** | Checks the registry once per launch (cached), and on request stages, verifies and swaps in a newer DSH — rolling itself back if the new one will not start. Nothing installs without a click |
-| **The settings UI is DSH's own** | A client plugin adds a section to DSH's settings dialog — appearance, shortcut, colours and updates — beside General, Models and Plugins; the shell's own window keeps them as a fallback for when DSH will not start |
+| **The settings UI is DSH's own** | A client plugin adds a section to DSH's settings dialog — appearance, shortcut, colours and updates — beside General, Models and Plugins. The tray's settings item opens that dialog, and the shell's own window remains as the fallback for when DSH will not start |
 | **A readable log** | Diagnostics go to `$DSH_HOME/cache/dsh-shell/dsh-shell.log`, not to a terminal a GUI app does not have |
 | **Plugin bridge** | A real DSH Host plugin forwards `agent/*` events to the shell |
 
@@ -486,7 +486,7 @@ xcrun stapler staple "DSH Shell.app"
 
 ```sh
 cargo run          # run from source
-cargo test         # 167 tests
+cargo test         # 169 tests
 cargo clippy       # lints
 ./scripts/make-icon.py   # regenerate the .icns from assets/app-icon.png
 ```
@@ -545,7 +545,7 @@ Everything below was exercised against a real DSH install on macOS 26 (arm64):
 
 | Part | Evidence |
 |---|---|
-| Builds | `cargo build` clean, 167 tests passing |
+| Builds | `cargo build` clean, 169 tests passing |
 | Window | Hidden titlebar, inset traffic lights, drag strip |
 | Renders DSH | Full web UI — sidebar, conversations, composer, cost meter |
 | Host supervision | Spawns `dsh web --no-open`, parses its authenticated URL |
