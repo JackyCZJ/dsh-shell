@@ -182,6 +182,34 @@ settings cog for an id it does not know, whereas borrowing an official icon mean
 importing a platform seed whose exports a hand-written bundle cannot verify — and
 a wrong name there fails the entire page.
 
+### Styled with DSH's tokens, not with colours of my own
+
+The first version used system colours and browser defaults — a hardcoded
+`1px solid rgba(128,128,128,.35)` border, `font: inherit`, a default colour
+swatch — which is why it read as a form bolted onto the app rather than part of
+it. It now uses the tokens DSH itself uses: `--dsw-alias-label-*` for text,
+`--dsw-alias-border-l2/l3` for hairlines, `--dsw-alias-bg-layer-1` for field
+fills, `--dsw-alias-interactive-bg-hover` for hover,
+`--dsw-alias-brand-primary` for the primary action, and the `--dsw-font-*` scale
+for type.
+
+Worth recording, because it means the *palette* was never the problem: the
+shell's own defaults already match those tokens exactly. `#4176e6` is
+`--dsw-static-deepseek-500`, `#81858c` is `--dsw-static-neutral-bluish-600`, and
+`#f5f6f7` is `--dsw-static-neutral-bluish-60`. The controls were what looked
+foreign, not the values.
+
+Every `var()` carries a literal fallback, and a test checks each token name
+against the ones DSH actually defines. That test earned its place immediately:
+three names were wrong (`-sm-13` where the scale says `-xs-13`, and a brand token
+that does not exist), and a mistyped token does not error — it silently renders
+the fallback, so the form would have kept the very colours this change removes.
+
+Two real CSS bugs also came out of it: `font: inherit` resets `line-height` and
+makes a later `font-size: inherit` resolve to the parent's size rather than the
+element's, and the focus ring referenced a token that exists only as an inlined
+value, not as a variable.
+
 Two endpoints carry it, on the same route:
 
 ```
