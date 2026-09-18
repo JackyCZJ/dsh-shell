@@ -21,18 +21,36 @@ use serde::{Deserialize, Serialize};
 /// The namespace this crate reads from the settings document.
 pub const SETTINGS_NAMESPACE: &str = "dsh-shell";
 
-/// Height of the draggable caption strip, in CSS pixels.
+/// Height of the caption row, in CSS pixels.
+///
+/// The shell does not place the traffic lights itself — macOS does — so this is
+/// read off where they actually land: measured on macOS 26 the buttons are 13pt
+/// circles centred 15.75pt below the window's top edge, and twice that centre
+/// is the height of the row they have to sit in. 32 is the nearest whole pixel,
+/// which puts them a quarter of one off the row's centre line.
 ///
 /// Deliberately not configurable. It is a fixed part of the window chrome, and
-/// exposing it invited a broken drag strip — the traffic lights would end up
-/// over the page, or the strip would not line up with them — far more easily
-/// than it enabled anything useful.
-pub const CAPTION_HEIGHT: u32 = 34;
+/// exposing it invited a row that no longer lines up with the lights — far more
+/// easily than it enabled anything useful.
+pub const CAPTION_HEIGHT: u32 = 32;
+
+/// Space the traffic lights occupy from the window's left edge, plus a gap
+/// before the row's first control, in CSS pixels.
+///
+/// The shell asks AppKit for [`TRAFFIC_LIGHT_INSET`], but AppKit also places
+/// the buttons itself and does not always take the request: on macOS 26 it is
+/// ignored and they sit at the system default. So this has to clear whichever
+/// placement wins — on the 24.5pt pitch measured here, 9 + 49 + 13 = 71pt if
+/// the request is ignored and 20 + 49 + 13 = 82pt if it is honoured — and leave
+/// a little air after them. Nothing may assume the request took effect.
+pub const TRAFFIC_LIGHT_GUTTER: u32 = 88;
 
 /// Inset of the traffic lights from the window's top-left, in CSS pixels.
 ///
-/// Also not configurable, for the same reason: it has to match the strip above,
-/// and the macOS default is what looks native.
+/// Kept because AppKit honours it on some releases, and it also sets the height
+/// of the native titlebar container the lights are centred in. Nothing on the
+/// page may depend on it having been applied, though: see
+/// [`TRAFFIC_LIGHT_GUTTER`].
 pub const TRAFFIC_LIGHT_INSET: (f64, f64) = (20.0, 20.0);
 
 /// A color stored as `#rrggbb`.
@@ -206,8 +224,8 @@ impl Theme {
     /// The CSS injected into the web UI for the resolved palette.
     ///
     /// DSH's own theme system owns the real design tokens; this block exists so
-    /// the shell can match the page to its chrome — background, and leaving room
-    /// for the caption strip — without fighting it. It also mirrors DSH's own
+    /// the shell can match the page to its chrome — background, and the room the
+    /// traffic lights need — without fighting it. It also mirrors DSH's own
     /// dark-mode marker so page and window agree on appearance.
     pub fn injected_css(&self, system_is_dark: bool) -> String {
         let p = self.palette_for(system_is_dark);
@@ -222,30 +240,44 @@ impl Theme {
   --dsh-shell-muted: {muted};
   --dsh-shell-accent: {accent};
   --dsh-shell-caption-height: {caption}px;
+  --dsh-shell-caption-gutter: {gutter}px;
 }}
 html, body {{
   background: {bg} !important;
 }}
-/* Reserve the caption strip so no DSH chrome hides under the traffic lights. */
+
+/* Reserve the caption row so nothing of the page hides under the traffic
+   lights. This strip is the safe layout and stays the fallback: the injected
+   script removes it as soon as it recognises DSH's own frame, whose sidebar
+   header carries the row instead. Pages the shell does not recognise — the
+   boot screen, an error page — keep it. */
 body {{
   padding-top: var(--dsh-shell-caption-height);
   box-sizing: border-box;
 }}
+html[data-dsh-shell-caption] body {{
+  padding-top: 0;
+}}
 
-/* The window-drag region.
-   With the system titlebar hidden, no OS drag area remains, so this strip
-   forwards pointer presses to the shell. It is transparent, sits above the
-   page, and covers only the reserved caption strip — never DSH's own UI. */
-#__dsh_shell_drag {{
-  position: fixed;
-  top: 0;
-  left: 0;
-  right: 0;
+/* DSH's sidebar header *is* the caption row: the lights land on the same line
+   as the brand and the collapse toggle rather than on a strip above them.
+   Both ends are reached structurally — the frame is whatever element lays the
+   three columns out, and the header is the sidebar's first row — so no
+   build-specific class name is involved and a React re-render cannot unset it. */
+html[data-dsh-shell-caption] div[style*="grid-template-columns"] > [class*="sidebarCol"] > * {{
+  padding-top: 0;
+}}
+html[data-dsh-shell-caption] div[style*="grid-template-columns"]:not([data-sidebar-collapsed]) > [class*="sidebarCol"] > * > :first-child {{
   height: var(--dsh-shell-caption-height);
-  z-index: 2147483647;
-  -webkit-app-region: drag;
-  user-select: none;
-  -webkit-user-select: none;
+  /* The negative margin cancels the sidebar's own inline padding, which would
+     otherwise push the row's first control past the gutter by another 12px. */
+  margin: 0 0 8px calc(-1 * var(--dsh-sidebar-inline-padding, 12px));
+  padding: 0 0 0 var(--dsh-shell-caption-gutter);
+}}
+/* Collapsed, the rail is 56px wide and its 36px controls do not fit beside the
+   lights, so the rail's icons stay below them instead of under them. */
+html[data-dsh-shell-caption] div[style*="grid-template-columns"][data-sidebar-collapsed] > [class*="sidebarCol"] > * {{
+  padding-top: var(--dsh-shell-caption-height);
 }}
 {custom}
 "#,
@@ -257,6 +289,7 @@ body {{
             muted = p.text_muted.css(),
             accent = p.accent.css(),
             caption = CAPTION_HEIGHT,
+            gutter = TRAFFIC_LIGHT_GUTTER,
             custom = self.custom_css,
         )
     }
@@ -667,6 +700,9 @@ dsh-shell:
         assert!(css.contains("#ff0000"));
         assert!(css.contains(&format!(
             "--dsh-shell-caption-height: {CAPTION_HEIGHT}px"
+        )));
+        assert!(css.contains(&format!(
+            "--dsh-shell-caption-gutter: {TRAFFIC_LIGHT_GUTTER}px"
         )));
         assert!(css.contains("padding-top: var(--dsh-shell-caption-height)"));
         assert!(css.trim_end().ends_with("/* custom */"));

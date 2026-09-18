@@ -374,3 +374,48 @@ mod tests {
         assert!(extract_url("dsh web: not-a-url").is_none());
     }
 }
+
+/// Compile a generated script with `node --check`.
+///
+/// Every page the shell builds embeds hand-written JavaScript inside a Rust
+/// string literal, where the compiler cannot see a syntax error. This is the
+/// only thing that can, and it runs on the real generated text rather than on
+/// a copy of it.
+///
+/// Skipped rather than failed when no node is available: the check is a safety
+/// net, not a dependency of the build.
+#[cfg(test)]
+pub(crate) fn assert_js_parses(script: &str, label: &str) {
+    let Some(node) = which_node() else {
+        eprintln!("no node found; skipping the parse check for {label}");
+        return;
+    };
+
+    // Unique per call, not per process: the tests run in parallel threads of one
+    // process, and a shared path meant two of them wrote this file at once — so
+    // `node --check` sometimes parsed a half-written script and reported a
+    // syntax error that was really a race.
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("dsh-script-check-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join(format!("{label}-{seq}.js"));
+    std::fs::write(&path, script).expect("write the extracted script");
+
+    let output = std::process::Command::new(&node)
+        .arg("--check")
+        .arg(&path)
+        .output();
+    let _ = std::fs::remove_file(&path);
+
+    match output {
+        Ok(output) => assert!(
+            output.status.success(),
+            "the {label} script does not parse:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        ),
+        // Raced with something that removed it; not this test's business.
+        Err(_) => eprintln!("could not run {}; skipping", node.display()),
+    }
+}

@@ -1571,21 +1571,6 @@ mod tests {
         );
     }
 
-    /// Write an executable shell script.
-    #[cfg(unix)]
-    fn write_script(path: &Path, body: &str) {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::write(path, body).unwrap();
-        let mut permissions = std::fs::metadata(path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(path, permissions).unwrap();
-    }
-
-    #[cfg(not(unix))]
-    fn write_script(_path: &Path, _body: &str) {
-        // The shell only builds on Unix today; see the README's known gaps.
-    }
-
     #[test]
     fn the_path_augmentation_puts_the_launcher_directory_first() {
         // Order matters: a stale `node` further along PATH must not win.

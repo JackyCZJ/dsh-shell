@@ -173,40 +173,7 @@ mod tests {
         let start = html.find("<script>").expect("the page has a script block");
         let body = &html[start + "<script>".len()..];
         let end = body.find("</script>").expect("the script block is closed");
-        let script = &body[..end];
-
-        let Some(node) = crate::server::which_node() else {
-            eprintln!("no node found; skipping the script parse check");
-            return;
-        };
-
-        // Unique per call, not per process: the tests run in parallel threads of
-        // one process, and a shared path meant two of them wrote this file at
-        // once — so `node --check` sometimes parsed a half-written script and
-        // reported a syntax error that was really a race.
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static SEQ: AtomicU32 = AtomicU32::new(0);
-        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("dsh-settings-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        let path = dir.join(format!("settings-{seq}.js"));
-        std::fs::write(&path, script).expect("write the extracted script");
-
-        let output = std::process::Command::new(&node)
-            .arg("--check")
-            .arg(&path)
-            .output();
-        let _ = std::fs::remove_file(&path);
-
-        match output {
-            Ok(output) => assert!(
-                output.status.success(),
-                "the settings script does not parse:\n{}",
-                String::from_utf8_lossy(&output.stderr)
-            ),
-            // Raced with something that removed it; not this test's business.
-            Err(_) => eprintln!("could not run {}; skipping", node.display()),
-        }
+        crate::server::assert_js_parses(&body[..end], "settings");
     }
 
     #[test]

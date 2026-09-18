@@ -1,8 +1,8 @@
 //! A native desktop shell for the DeepSeek Harness web UI.
 //!
 //! The window has no system titlebar. The content fills the frame edge to edge,
-//! and the traffic lights are inset so they float over the page — the same shape
-//! as the upstream Electron desktop app, without shipping Chromium.
+//! and the traffic lights sit on DSH's own sidebar header — the same shape as
+//! the upstream Electron desktop app, without shipping Chromium.
 //!
 //! The webview is the OS's own engine: WebKit on macOS, WebView2 on Windows,
 //! WebKitGTK on Linux. Nothing is bundled, so the binary stays small and the
@@ -53,16 +53,16 @@ fn boot_page(locale: crate::i18n::Locale) -> String {
 /// imperceptible to a user and costs nothing measurable when idle.
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
-/// IPC message the injected drag region posts to start a window move.
+/// IPC message the injected drag listener posts to start a window move.
 ///
 /// The string is namespaced because the same channel carries any future
 /// shell-to-host messages.
 const DRAG_MESSAGE: &str = "dsh-shell:drag";
 
-/// IPC message for the double-click-to-zoom action on the drag strip.
+/// IPC message for the double-click-to-zoom action on the caption row.
 const ZOOM_MESSAGE: &str = "dsh-shell:zoom";
 
-/// Sent once the drag region is live, so the shell can confirm the window is
+/// Sent once the drag listener is live, so the shell can confirm the window is
 /// movable instead of leaving a silent dead zone if injection failed.
 const READY_MESSAGE: &str = "dsh-shell:drag-ready";
 
@@ -318,9 +318,9 @@ fn main() {
     }
 
     // With the system titlebar hidden there is no OS drag region left, so the
-    // page itself has to ask the window to move. A thin strip along the top is
-    // marked draggable in CSS; pointerdown there posts an IPC message, and the
-    // handler below turns it into an actual window drag.
+    // page itself has to ask the window to move. Its injected script forwards
+    // presses on empty chrome in the caption row; the handler below turns one
+    // into an actual window drag.
     //
     // The handler runs on the main thread, which is what makes calling
     // `drag_window()` here sound. A background thread could not do this.
@@ -354,7 +354,7 @@ fn main() {
                     window.set_maximized(!window.is_maximized());
                 }
                 READY_MESSAGE => {
-                    tracing::info!("drag region ready; window is movable from the caption strip")
+                    tracing::info!("drag listener ready; window is movable from the caption row")
                 }
                 other => tracing::debug!(message = %other, "ignoring unknown shell IPC message"),
             }
@@ -1498,16 +1498,20 @@ fn hex_to_rgba(hex: u32) -> (u8, u8, u8, u8) {
     )
 }
 
-/// Script that installs the theme styles and the window-drag region on load.
+/// Script that installs the theme styles, the caption row and the window drag.
 ///
-/// Both are installed here rather than through separate initialization scripts
-/// so they share one `DOMContentLoaded` path and survive navigations together.
+/// All three are installed here rather than through separate initialization
+/// scripts so they share one `DOMContentLoaded` path and survive navigations
+/// together.
 fn inject_script(theme: &Theme, is_dark: bool) -> String {
     format!(
         r#"(function() {{
+  var CAPTION = {caption};
+
   var apply = function() {{
     applyStyles();
-    applyDragRegion();
+    installCaptionRow();
+    installDrag();
   }};
   if (document.readyState === 'loading') {{
     document.addEventListener('DOMContentLoaded', apply);
@@ -1525,48 +1529,112 @@ fn inject_script(theme: &Theme, is_dark: bool) -> String {
     el.textContent = {payload};
   }}
 
-  // With the system titlebar hidden there is no OS drag area, so a strip along
-  // the top of the page forwards pointer presses to the shell, which moves the
-  // window. The strip only covers empty chrome: the strip sits above DSH's own
-  // content because the page is padded down by --dsh-shell-caption-height.
-  function applyDragRegion() {{
-    if (document.getElementById('__dsh_shell_drag')) return;
-    if (!document.documentElement) {{
-      console.error('[dsh-shell] no documentElement; drag region not installed');
-      return;
-    }}
-    var strip = document.createElement('div');
-    strip.id = '__dsh_shell_drag';
-    strip.setAttribute('aria-hidden', 'true');
-    document.documentElement.appendChild(strip);
+  // The traffic lights are placed by the shell - and, when AppKit overrules it,
+  // by the system - so the page is the side that has to make room. DSH's own
+  // sidebar header can carry the caption row, and marking the document is what
+  // hands the row over to the CSS. Anything not recognised keeps the reserved
+  // strip, which is the layout that works anywhere.
+  function installCaptionRow() {{
+    var frames = 0;
+    var step = function() {{
+      if (recognise() !== 'retry') return;
+      // Polling on frame boundaries rather than a timer: the header is found in
+      // the same frame React commits it, so the strip never visibly jumps. A
+      // hidden window paints nothing and stops polling, which is fine - it is
+      // also not on screen.
+      if (++frames > 600) return;
+      window.requestAnimationFrame(step);
+    }};
+    step();
+  }}
 
-    strip.addEventListener('pointerdown', function (event) {{
+  // 'done' when the document is settled, 'retry' while the app is still coming.
+  function recognise() {{
+    var html = document.documentElement;
+    if (!html || html.hasAttribute('data-dsh-shell-caption')) return 'done';
+    var frame = document.querySelector('div[style*="grid-template-columns"]');
+    if (!frame) return 'retry';
+    var column = frame.querySelector(':scope > [class*="sidebarCol"]');
+    if (!column) return 'retry';
+
+    // The header is identified twice and only used when both agree: the CSS
+    // reaches it structurally, as the sidebar's first row, while this asks for
+    // the parent of the sidebar's first control. A wrapper the slot renderer
+    // added, or a contribution that renders first, would move one of them and
+    // put the lights on top of DSH's own UI - so on any disagreement the strip
+    // stays and the shell says why.
+    var structural = column.firstElementChild && column.firstElementChild.firstElementChild;
+    var control = column.querySelector('button');
+    var byControl = control && control.parentElement;
+    var box = structural && structural.getBoundingClientRect();
+    var columnBox = column.getBoundingClientRect();
+    var isHeaderRow = box && box.height >= 16 && box.height <= 120 &&
+      box.top <= columnBox.top + 8;
+
+    if (structural && structural === byControl && isHeaderRow) {{
+      html.setAttribute('data-dsh-shell-caption', '');
+      return 'done';
+    }}
+    if (box && !window.__dshShellCaptionWarned) {{
+      window.__dshShellCaptionWarned = true;
+      console.warn('[dsh-shell] sidebar header not recognised; keeping the caption strip');
+    }}
+    return 'retry';
+  }}
+
+  // Window drag. With the system titlebar hidden there is no OS drag area left,
+  // so presses on empty chrome in the caption row are forwarded to the shell,
+  // which moves the window. This is a listener on the document rather than a
+  // strip laid over the row because DSH has real controls on that row now:
+  // only what is not interactive may start a drag.
+  function installDrag() {{
+    if (window.__dshShellDrag) return;
+    window.__dshShellDrag = true;
+
+    var CONTROLS = 'a,button,input,select,textarea,summary,label,[contenteditable],' +
+      '[role="button"],[role="link"],[role="tab"],[role="menuitem"],[role="menuitemcheckbox"],' +
+      '[role="option"],[role="switch"],[role="checkbox"],[data-side]';
+
+    var chrome = function(event) {{
       // Left button only. Right-click must still open context menus, and
       // double-click should keep the platform's zoom behaviour.
-      if (event.button !== 0) return;
-      event.preventDefault();
-      if (window.ipc && window.ipc.postMessage) {{
-        window.ipc.postMessage({drag_message});
-      }}
-    }});
+      if (event.button !== 0) return false;
+      if (event.clientY > CAPTION) return false;
+      var target = event.target;
+      if (!target || typeof target.closest !== 'function') return false;
+      if (target.closest(CONTROLS)) return false;
+      // A cursor that says "drag me" is a control too: DSH's column handles
+      // are plain divs, and a window drag there would fight the resize.
+      var cursor = window.getComputedStyle(target).cursor;
+      return cursor === 'default' || cursor === 'auto';
+    }};
 
-    // Double-clicking empty chrome should zoom the window, matching the
-    // behaviour a real titlebar would have.
-    strip.addEventListener('dblclick', function () {{
-      if (window.ipc && window.ipc.postMessage) {{
-        window.ipc.postMessage({zoom_message});
-      }}
-    }});
+    var post = function(message) {{
+      if (window.ipc && window.ipc.postMessage) window.ipc.postMessage(message);
+    }};
+
+    document.addEventListener('pointerdown', function(event) {{
+      if (!chrome(event)) return;
+      event.preventDefault();
+      post({drag_message});
+    }}, true);
+
+    document.addEventListener('dblclick', function(event) {{
+      if (!chrome(event)) return;
+      event.preventDefault();
+      post({zoom_message});
+    }}, true);
 
     if (!window.ipc || !window.ipc.postMessage) {{
-      // Without the IPC bridge the strip is inert and the window becomes
-      // unmovable. Report it so the dead zone is diagnosable rather than silent.
+      // Without the IPC bridge the window cannot be moved at all. Report it so
+      // the dead zone is diagnosable rather than silent.
       console.error('[dsh-shell] window.ipc unavailable; window drag is disabled');
     }} else {{
-      window.ipc.postMessage({ready_message});
+      post({ready_message});
     }}
   }}
 }})();"#,
+        caption = theme::CAPTION_HEIGHT,
         payload = json_string(&theme.injected_css(is_dark)),
         drag_message = json_string(DRAG_MESSAGE),
         zoom_message = json_string(ZOOM_MESSAGE),
@@ -1665,28 +1733,109 @@ mod tests {
     }
 
     #[test]
-    fn injected_script_installs_the_drag_region() {
+    fn injected_script_forwards_drags_from_empty_chrome() {
         let script = inject_script(&Theme::default(), false);
-        // The strip must be created and wired to IPC, or the window cannot be
-        // moved at all once the system titlebar is hidden.
-        assert!(script.contains("__dsh_shell_drag"), "drag element missing");
+        // The listener must be wired to IPC, or the window cannot be moved at
+        // all once the system titlebar is hidden.
         assert!(script.contains(DRAG_MESSAGE), "drag message not posted");
         assert!(script.contains(ZOOM_MESSAGE), "zoom message not posted");
         assert!(script.contains("pointerdown"), "no pointer handler");
         // Only the primary button may start a drag, so right-click menus work.
         assert!(script.contains("event.button !== 0"), "button guard missing");
+        // Only empty chrome may: DSH's own controls are on the caption row now,
+        // so the listener has to defer to them and to the column handles.
+        assert!(script.contains("target.closest(CONTROLS)"), "no control guard");
+        assert!(script.contains("[data-side]"), "column handles not excluded");
+        // The row the script treats as chrome and the row the CSS reserves have
+        // to be the same one.
+        assert!(
+            script.contains(&format!("var CAPTION = {}", theme::CAPTION_HEIGHT)),
+            "caption height missing from the script"
+        );
     }
 
     #[test]
-    fn drag_strip_css_is_injected() {
-        let css = Theme::default().injected_css(false);
-        assert!(css.contains("#__dsh_shell_drag"), "drag strip CSS missing");
-        // The strip must be topmost, or DSH's own chrome would cover it.
-        assert!(css.contains("z-index: 2147483647"), "strip not on top");
-        // It must span the caption strip only, never the whole page.
+    fn the_injected_script_parses() {
+        // All of the page-side behaviour lives in one hand-written literal, so a
+        // typo there would otherwise surface only as a dead window at runtime.
+        for is_dark in [false, true] {
+            crate::server::assert_js_parses(&inject_script(&Theme::default(), is_dark), "injected");
+        }
+    }
+
+    #[test]
+    fn injected_script_hands_the_caption_row_to_the_stylesheet() {
+        let script = inject_script(&Theme::default(), false);
+        // Recognition is what swaps the reserved strip for DSH's own header, so
+        // it has to look for the frame and the header's controls, and it has to
+        // give up quietly when the page is not DSH's app.
+        assert!(script.contains("[data-dsh-shell-caption]"), "marker missing");
+        assert!(script.contains("grid-template-columns"), "frame not looked for");
+        assert!(script.contains("sidebarCol"), "sidebar column not looked for");
         assert!(
-            css.contains("height: var(--dsh-shell-caption-height)"),
-            "strip height not tied to the caption strip"
+            script.contains("structural === byControl"),
+            "the header is not checked before the strip is dropped"
+        );
+        assert!(
+            script.contains("requestAnimationFrame"),
+            "the app would not be waited for"
+        );
+    }
+
+    #[test]
+    fn css_carries_the_caption_row_geometry() {
+        let css = Theme::default().injected_css(false);
+        // The fallback strip has to stay: it is the layout for every page whose
+        // DOM the shell does not recognise.
+        assert!(
+            css.contains("padding-top: var(--dsh-shell-caption-height)"),
+            "reserved strip missing"
+        );
+        assert!(
+            css.contains(&format!(
+                "--dsh-shell-caption-gutter: {gutter}px",
+                gutter = theme::TRAFFIC_LIGHT_GUTTER
+            )),
+            "caption gutter missing"
+        );
+        // The row is handed to DSH's sidebar header, reached structurally so a
+        // React re-render or an upgraded DSH cannot unset it.
+        assert!(css.contains("html[data-dsh-shell-caption] body"), "strip not dropped");
+        assert!(css.contains("[class*=\"sidebarCol\"]"), "sidebar column not targeted");
+        assert!(
+            css.contains("--dsh-sidebar-inline-padding"),
+            "the sidebar's own padding is not accounted for"
+        );
+        // The collapsed rail cannot host the lights, so it must keep clear of
+        // them rather than share the line.
+        assert!(
+            css.contains("[data-sidebar-collapsed]"),
+            "the collapsed rail is not handled"
+        );
+        // The old strip element is gone: the drag is a listener now.
+        assert!(!css.contains("__dsh_shell_drag"), "stale drag strip CSS");
+    }
+
+    #[test]
+    fn the_caption_gutter_clears_the_lights_wherever_appkit_puts_them() {
+        // AppKit places the buttons itself and does not always take the inset
+        // the shell asks for, so the row's first control has to clear the
+        // widest placement of either. Measured on macOS 26: 13pt buttons on a
+        // 24.5pt pitch.
+        const BUTTON: f64 = 13.0;
+        const PITCH: f64 = 24.5;
+        let honoured = theme::TRAFFIC_LIGHT_INSET.0 + 2.0 * PITCH + BUTTON;
+        let ignored = 9.0 + 2.0 * PITCH + BUTTON;
+        let widest = honoured.max(ignored);
+        assert!(
+            theme::TRAFFIC_LIGHT_GUTTER as f64 > widest,
+            "gutter {} does not clear the lights at {widest}",
+            theme::TRAFFIC_LIGHT_GUTTER
+        );
+        // And the row has to be tall enough to centre them in.
+        assert!(
+            theme::CAPTION_HEIGHT as f64 >= BUTTON,
+            "caption row shorter than the buttons"
         );
     }
 

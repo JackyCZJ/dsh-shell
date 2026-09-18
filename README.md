@@ -3,7 +3,8 @@
 A native desktop shell for the **DeepSeek Harness** web UI.
 
 No system titlebar. The page fills the window edge to edge and the macOS traffic
-lights float over it. The renderer is the platform's own webview — **WebKit** on
+lights sit on DSH's own sidebar header, in the row with the brand and the
+collapse toggle. The renderer is the platform's own webview — **WebKit** on
 macOS, WebView2 on Windows, WebKitGTK on Linux — so nothing is bundled and the
 binary stays ~2.7 MB.
 
@@ -32,8 +33,8 @@ runtime it was trying to avoid in the first place.
 
 | | |
 |---|---|
-| **No system titlebar** | Transparent titlebar, full-size content, inset traffic lights |
-| **Window dragging** | A drag strip over the caption area, since no OS drag region remains |
+| **No system titlebar** | Transparent titlebar, full-size content, traffic lights on DSH's own sidebar header |
+| **Window dragging** | Any empty chrome in the caption row, since no OS drag region remains |
 | **Native app menu** | Standard Edit menu, so ⌘C/⌘V/⌘X/⌘A work |
 | **Tray icon** | Agent state (idle / working / failed) as a colour-coded whale, rasterised at 2x and antialiased |
 | **Global hotkey** | **⌘⇧D** summons the window from anywhere |
@@ -140,8 +141,8 @@ ctx.settings.update('dsh-shell', { hotkey: 'meta+alt+K' })
 
 ### Applied live
 
-Both palettes, the caption height, the traffic-light inset, the hotkey, and
-`customCss` apply **without a restart and without losing the session**. The file
+Both palettes, the hotkey, and `customCss` apply **without a restart and without
+losing the session**. The file
 watcher covers hand edits; a change written through the namespace is pushed to
 the shell so it lands immediately rather than waiting out the debounce.
 
@@ -165,9 +166,10 @@ position: it mirrors DSH's preference and offers no override of its own.
 Both palettes are taken from **DSH's own boot-theme CSS** (`#151517` dark,
 `#ffffff` light), so the window chrome and the page share one colour.
 
-The caption-strip height and the traffic-light inset are **not configurable**.
-They are fixed chrome that has to line up with itself, and exposing them invited
-a broken drag strip far more easily than it enabled anything useful. They live as
+The caption height, the space reserved for the traffic lights, and the inset the
+shell asks AppKit for are **not configurable**. They are fixed chrome that has to
+line up with itself, and exposing them invited a row that no longer lines up with
+the lights far more easily than it enabled anything useful. They live as
 constants in `src/theme.rs`.
 
 ## Language
@@ -264,7 +266,7 @@ field fails the suite rather than quietly degrading a notification.
 
 ```
 src/
-  main.rs    window, traffic lights, webview, event loop, CSS injection
+  main.rs    window, traffic lights, webview, event loop, page injection
   menu.rs    the application menu (what makes ⌘C/⌘V work)
   native.rs  tray, notifications, global hotkey, appearance detection
   server.rs  spawns `dsh web`, parses its URL, kills it on exit
@@ -281,6 +283,34 @@ assets/
   deepseek.icns   the squircle-masked icon built from it
 # configuration lives in DSH's settings.yaml
 ```
+
+### Where the traffic lights sit
+
+With the system titlebar hidden there is no OS drag region and no OS-owned
+caption area, so the row the lights live on is the shell's problem. Three facts
+shape how it is solved, all measured on macOS 26 (arm64):
+
+* **macOS places the buttons, not the shell.** `with_traffic_light_inset` asks
+  AppKit to inset them, and AppKit does resize the titlebar container around
+  that request — but it also lays the buttons out itself and does not always take
+  the request. Measured from the screen they sit roughly 10–70pt from the left
+  edge, centred 15.75pt down, so the page reserves the *widest* placement of
+  either case rather than trusting the inset.
+* **HTML under them still receives pointer events.** The titlebar container view
+  passes presses through to the web content, which is what makes it possible to
+  put the lights on a row that also has working controls. Verified with a
+  throwaway `tao` + `wry` window configured exactly like this one, a 32pt band
+  that turned green on `pointermove`, and a warped cursor — not assumed.
+* **The page has to recognise the row, and fails safe.** The injected CSS
+  reserves a strip by default and drops it only once the script has identified
+  DSH's own frame and sidebar header — twice, structurally and as the parent of
+  the sidebar's first control, and only when the two agree. A DSH that
+  restructures its sidebar keeps the strip instead of wearing the lights on top
+  of its UI.
+
+The drag is a `pointerdown` listener on the document rather than a strip laid
+over the row: only chrome that is not interactive starts a window move, so DSH's
+brand, its collapse toggle and the session header keep their own clicks.
 
 ### Runtime files
 
@@ -486,7 +516,7 @@ xcrun stapler staple "DSH Shell.app"
 
 ```sh
 cargo run          # run from source
-cargo test         # 169 tests
+cargo test         # 173 tests
 cargo clippy       # lints
 ./scripts/make-icon.py   # regenerate the .icns from assets/app-icon.png
 ```
@@ -545,8 +575,8 @@ Everything below was exercised against a real DSH install on macOS 26 (arm64):
 
 | Part | Evidence |
 |---|---|
-| Builds | `cargo build` clean, 169 tests passing |
-| Window | Hidden titlebar, inset traffic lights, drag strip |
+| Builds | `cargo build` clean, 173 tests passing |
+| Window | Hidden titlebar, traffic lights on DSH's sidebar header, drag from the caption row |
 | Renders DSH | Full web UI — sidebar, conversations, composer, cost meter |
 | Host supervision | Spawns `dsh web --no-open`, parses its authenticated URL |
 | Clean shutdown | The host process dies with the window; no orphans |

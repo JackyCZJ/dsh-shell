@@ -611,6 +611,7 @@ mod tests {
         assert!(std::ptr::eq(first, second), "coverage was rasterised more than once");
     }
 
+    #[test]
     fn the_whale_actually_covers_pixels() {
         // Guards the whole rasterisation chain: if the fill or the winding were
         // wrong, the mask would come back empty and the tray would show nothing.
