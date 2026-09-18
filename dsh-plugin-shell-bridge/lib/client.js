@@ -235,8 +235,8 @@ window.__ModuleLoader__.load({
 			return jsx.jsx('div', { children })
 		}
 
-		/** Required service: the UI slot registry. */
-		const inject = ['slots']
+		/** Required services: the UI slot registry and the locale runtime. */
+		const inject = ['slots', 'locale']
 
 		/**
 		 * A few rules for the row.

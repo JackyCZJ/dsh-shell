@@ -109,7 +109,7 @@ test('applying the bundle registers dictionaries and one settings row', () => {
 test('the bundle declares the services it needs', () => {
 	const module = loadBundle()
 	const exports = module.factory(fakeRequire)
-	assert.deepEqual(exports.inject, ['slots'])
+	assert.deepEqual(exports.inject, ['slots', 'locale'])
 })
 
 test('the bundle requires only the platform seeds it declares', () => {
