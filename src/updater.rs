@@ -331,11 +331,33 @@ fn run_with_timeout(
     args: &[&str],
     timeout: std::time::Duration,
 ) -> Result<String, String> {
-    let mut child = std::process::Command::new(program)
+    run_with_timeout_hinted(program, args, timeout, None)
+}
+
+/// As [`run_with_timeout`], with a launcher whose `node` must also be findable.
+///
+/// The hint matters for the same reason it does when the host is spawned: a
+/// package manager's `dsh` is a `#!/usr/bin/env node` script and a GUI app's
+/// PATH has no `node`, so the probe fails with exit 127, `env: node: No such
+/// file or directory`, unless the launcher's own directory is prepended. The
+/// host already got this treatment; the update check did not, and reported a
+/// healthy install as broken.
+fn run_with_timeout_hinted(
+    program: &Path,
+    args: &[&str],
+    timeout: std::time::Duration,
+    path_hint: Option<&Path>,
+) -> Result<String, String> {
+    let mut command = std::process::Command::new(program);
+    command
         .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if let Some(hint) = path_hint {
+        crate::server::augment_path_for_std(&mut command, &hint.to_string_lossy());
+    }
+    let mut child = command
         .spawn()
         .map_err(|err| format!("could not run {}: {err}", program.display()))?;
 
@@ -405,19 +427,28 @@ fn run_with_timeout(
 }
 
 /// The version a launcher reports.
+/// The version a launcher reports.
+///
+/// `launcher` doubles as the PATH hint: its directory is where the `node` that
+/// runs it lives, and a GUI app has none of that on PATH.
 pub fn version_of(launcher: &Path) -> Result<Version, String> {
-    version_of_args(launcher, &[])
+    version_of_hinted(launcher, &[], Some(launcher))
 }
 
 /// The version a `(program, leading args)` pair reports.
 ///
 /// The leading-args form exists because a staged tree has no executable shim:
 /// proving it starts means running `<bun> run <staged>/bin.js --version`, which
-/// is the same thing the installed shim does.
-pub fn version_of_args(program: &Path, leading: &[String]) -> Result<Version, String> {
+/// is the same thing the installed shim does. `hint` supplies the directory to
+/// prepend to PATH — for a staged tree that is the `bun` that will run it.
+pub fn version_of_hinted(
+    program: &Path,
+    leading: &[String],
+    hint: Option<&Path>,
+) -> Result<Version, String> {
     let mut args: Vec<&str> = leading.iter().map(String::as_str).collect();
     args.push("--version");
-    let out = run_with_timeout(program, &args, std::time::Duration::from_secs(60))?;
+    let out = run_with_timeout_hinted(program, &args, std::time::Duration::from_secs(60), hint)?;
     // A launcher prints exactly the version; take the last line to tolerate a
     // warning printed before it.
     let line = out.lines().last().unwrap_or("").trim();
@@ -425,8 +456,11 @@ pub fn version_of_args(program: &Path, leading: &[String]) -> Result<Version, St
 }
 
 /// Convenience for the `(program, args)` shape [`Install::staged_command`] returns.
-fn version_of_script(command: &(PathBuf, Vec<String>)) -> Result<Version, String> {
-    version_of_args(&command.0, &command.1)
+fn version_of_script(
+    command: &(PathBuf, Vec<String>),
+    hint: Option<&Path>,
+) -> Result<Version, String> {
+    version_of_hinted(&command.0, &command.1, hint)
 }
 
 // ------------------------------------------------------------------ registry
@@ -615,7 +649,9 @@ pub fn stage(install: &Install, version: &Version) -> Result<PathBuf, String> {
         tracing::warn!("staged smoke test skipped by DSH_SHELL_UPDATER_SKIP_SMOKE");
         return Ok(dir);
     }
-    let reported = version_of_script(&install.staged_command(version)?)
+    // The staged tree is run by the `bun` that installed it, so that is what
+    // needs to be on PATH for the smoke test.
+    let reported = version_of_script(&install.staged_command(version)?, install.bun.as_deref())
         .map_err(|err| format!("the staged {version} could not start: {err}"))?;
     if reported != *version {
         return Err(format!(
@@ -1446,6 +1482,81 @@ mod tests {
         record_pending(&install, &v("0.1.5-rc.1")).unwrap();
         record_pending(&install, &v("0.1.5-rc.2")).unwrap();
         assert_eq!(pending(&install), Some(v("0.1.5-rc.2")));
+    }
+
+    // ------------------------------------------------- the PATH the GUI lacks
+
+    /// Serialises the tests that mutate `PATH`/`HOME`, which are process-wide.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn a_launcher_needing_node_is_found_through_the_launcher_directory() {
+        // The real failure this guards: a Finder-launched app has launchd's PATH
+        // (no `node`), and `dsh` is a `#!/usr/bin/env node` script, so the probe
+        // died with exit 127 and "env: node: No such file or directory" while
+        // the install was perfectly healthy.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let root = tempdir::TempDir::new("dsh-path-test");
+        let bin = root.path().join("bin");
+        let home = root.path().join("home");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+
+        // A stand-in for `node` that identifies itself, and a launcher that goes
+        // through `env`, exactly as the shipped shim does.
+        write_script(&bin.join("node"), "#!/bin/sh\necho 7.7.7-rc.1\n");
+        let launcher = bin.join("dsh");
+        write_script(&launcher, "#!/usr/bin/env node\n");
+
+        // A GUI app's PATH, and a HOME with no node in it either, so the
+        // launcher's own directory is the only way through.
+        let saved_path = std::env::var_os("PATH");
+        let saved_home = std::env::var_os("HOME");
+        std::env::set_var("PATH", "/usr/bin:/bin");
+        std::env::set_var("HOME", &home);
+
+        let result = version_of(&launcher);
+
+        if let Some(value) = saved_path {
+            std::env::set_var("PATH", value);
+        } else {
+            std::env::remove_var("PATH");
+        }
+        if let Some(value) = saved_home {
+            std::env::set_var("HOME", value);
+        } else {
+            std::env::remove_var("HOME");
+        }
+
+        assert_eq!(
+            result.expect("the launcher should have found node on the augmented PATH"),
+            v("7.7.7-rc.1")
+        );
+    }
+
+    /// Write an executable shell script.
+    #[cfg(unix)]
+    fn write_script(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, body).unwrap();
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[cfg(not(unix))]
+    fn write_script(_path: &Path, _body: &str) {
+        // The shell only builds on Unix today; see the README's known gaps.
+    }
+
+    #[test]
+    fn the_path_augmentation_puts_the_launcher_directory_first() {
+        // Order matters: a stale `node` further along PATH must not win.
+        let augmented = crate::server::path_with_node("/opt/custom/bin/dsh");
+        let first = augmented.split(':').next().unwrap_or_default();
+        assert_eq!(first, "/opt/custom/bin");
+        // The existing PATH survives, so nothing else the launcher needs is lost.
+        assert!(augmented.contains("/usr/bin") || std::env::var("PATH").unwrap_or_default().is_empty());
     }
 
     /// The whole staged path against a real registry: install, verify, swap.

@@ -96,7 +96,25 @@ pub fn resolve_launcher(configured: &str) -> String {
 /// exists — the launcher is found but immediately exits. Prepending the
 /// launcher's own directory (and any node found nearby) is what makes a
 /// Finder double-click work.
-fn augment_path_for(cmd: &mut Command, launcher: &str) {
+///
+/// Public because anything that runs the same launcher needs it, not just the
+/// host: the updater's `dsh --version` probe failed with exactly this exit 127
+/// until it was given the same treatment.
+pub fn augment_path_for(cmd: &mut Command, launcher: &str) {
+    cmd.env("PATH", path_with_node(launcher));
+}
+
+/// The same PATH, for a synchronous `std::process::Command`.
+///
+/// The computation is shared rather than duplicated: the two callers must agree
+/// on where `node` is, or one of them works and the other reports a healthy
+/// install as broken.
+pub fn augment_path_for_std(cmd: &mut std::process::Command, launcher: &str) {
+    cmd.env("PATH", path_with_node(launcher));
+}
+
+/// PATH with the launcher's directory and any nearby `node` prepended.
+pub fn path_with_node(launcher: &str) -> String {
     let mut prepend: Vec<PathBuf> = Vec::new();
 
     // The directory holding the launcher usually holds `node` too: bun, volta,
@@ -119,12 +137,11 @@ fn augment_path_for(cmd: &mut Command, launcher: &str) {
         .collect();
     parts.push(existing);
     // Filter empties so a leading colon cannot inject the cwd.
-    let joined = parts
+    parts
         .into_iter()
         .filter(|p| !p.is_empty())
         .collect::<Vec<_>>()
-        .join(":");
-    cmd.env("PATH", joined);
+        .join(":")
 }
 
 /// Find a `node` binary in the usual places.
