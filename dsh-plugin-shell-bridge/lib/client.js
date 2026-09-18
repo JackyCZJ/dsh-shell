@@ -51,6 +51,31 @@ window.__ModuleLoader__.load({
 			'notChecked': '尚未检查。',
 			'noShell': '桌面 shell 未连接，无法升级。',
 			'channel': '通道：{channel}',
+
+			'config.title': 'DSH Shell 外观与快捷键',
+			'config.hint': '改动会立即生效，无需重启。',
+			'config.hotkey': '唤起快捷键',
+			'config.hotkeyHint': '至少需要一个修饰键，例如 meta+shift+D。',
+			'config.light': '亮色',
+			'config.dark': '暗色',
+			'config.customCss': '自定义 CSS',
+			'config.customCssHint': '追加在内置规则之后，因此优先级最高。',
+			'config.save': '保存',
+			'config.revert': '还原',
+			'config.saving': '保存中…',
+			'config.saved': '已保存，立即生效。',
+			'config.unsaved': '有未保存的改动。',
+			'config.loading': '读取中…',
+			'config.unavailable': '设置服务不可用，无法在这里修改配置。',
+			'config.badHotkey': '快捷键至少需要一个修饰键（meta/ctrl/alt/shift）。',
+			'config.badColour': '颜色必须是六位十六进制，例如 #4176e6。',
+			'config.colour.background': '背景',
+			'config.colour.surface': '表面',
+			'config.colour.surfaceHover': '悬停表面',
+			'config.colour.border': '边框',
+			'config.colour.text': '文字',
+			'config.colour.textMuted': '次要文字',
+			'config.colour.accent': '强调色',
 		}
 		const en = {
 			'title': 'DSH version',
@@ -68,6 +93,31 @@ window.__ModuleLoader__.load({
 			'notChecked': 'Not checked yet.',
 			'noShell': 'No desktop shell is connected, so it cannot upgrade.',
 			'channel': 'Channel: {channel}',
+
+			'config.title': 'DSH Shell appearance and shortcut',
+			'config.hint': 'Changes apply immediately; no restart.',
+			'config.hotkey': 'Summon shortcut',
+			'config.hotkeyHint': 'At least one modifier is required, e.g. meta+shift+D.',
+			'config.light': 'Light',
+			'config.dark': 'Dark',
+			'config.customCss': 'Custom CSS',
+			'config.customCssHint': 'Appended after the built-in rules, so it wins.',
+			'config.save': 'Save',
+			'config.revert': 'Revert',
+			'config.saving': 'Saving…',
+			'config.saved': 'Saved. Applied immediately.',
+			'config.unsaved': 'Unsaved changes.',
+			'config.loading': 'Loading…',
+			'config.unavailable': 'The settings service is unavailable, so the configuration cannot be edited here.',
+			'config.badHotkey': 'A shortcut needs at least one modifier (meta/ctrl/alt/shift).',
+			'config.badColour': 'A colour must be six-digit hex, e.g. #4176e6.',
+			'config.colour.background': 'Background',
+			'config.colour.surface': 'Surface',
+			'config.colour.surfaceHover': 'Surface hover',
+			'config.colour.border': 'Border',
+			'config.colour.text': 'Text',
+			'config.colour.textMuted': 'Muted text',
+			'config.colour.accent': 'Accent',
 		}
 
 		/**
@@ -77,9 +127,13 @@ window.__ModuleLoader__.load({
 		 * @param {string} method - HTTP method.
 		 * @returns {Promise<object>} the parsed body, or an `{ok:false}` shape.
 		 */
-		async function call(action, method) {
+		async function call(action, method, body) {
 			try {
-				const response = await fetch(`${ROUTE}/${action}`, { method })
+				const response = await fetch(`${ROUTE}/${action}`, {
+					method,
+					headers: body === undefined ? undefined : { 'content-type': 'application/json' },
+					body: body === undefined ? undefined : JSON.stringify(body),
+				})
 				if (!response.ok && response.status !== 200) {
 					return { ok: false, error: `HTTP ${response.status}` }
 				}
@@ -92,16 +146,331 @@ window.__ModuleLoader__.load({
 		/** The strings the component uses. */
 		let t = (key) => key
 
+		/** The palette field names the shell defines, in display order. */
+		const PALETTE_KEYS = [
+			'background',
+			'surface',
+			'surfaceHover',
+			'border',
+			'text',
+			'textMuted',
+			'accent',
+		]
+
+		/** A six-digit hex colour, which is what the shell's own validation takes. */
+		const HEX = /^#[0-9a-fA-F]{6}$/
+
 		/**
-		 * The Updates row.
+		 * The changes between what the form holds and what was loaded.
 		 *
-		 * Rendered inside DSH's own General settings section, so it looks like
-		 * every other setting. `renderSlot` is supplied by the slot host.
+		 * Only differences are sent. The write is a merge, so resending an
+		 * untouched field is harmless — but sending one the shell did not resolve
+		 * (an older document has no `updateChannel`) would overwrite a value this
+		 * form never read, which is not.
 		 *
-		 * @param props - composed slot props.
+		 * @param base - the configuration as loaded.
+		 * @param local - the configuration as edited.
+		 * @returns the patch to send, which may be empty.
+		 */
+		function diff(base, local) {
+			const patch = {}
+			if (base === null || local === null) return patch
+			if (local.hotkey !== base.hotkey) patch.hotkey = local.hotkey
+			if (local.customCss !== base.customCss) patch.customCss = local.customCss
+			if (local.updateChannel !== base.updateChannel && base.updateChannel !== undefined) {
+				patch.updateChannel = local.updateChannel
+			}
+			for (const name of ['light', 'dark']) {
+				const from = base[name]
+				const to = local[name]
+				if (from === undefined || to === undefined) continue
+				for (const key of PALETTE_KEYS) {
+					if (to[key] !== undefined && to[key] !== from[key]) {
+						patch[name] = { ...(patch[name] ?? {}), [key]: to[key] }
+					}
+				}
+			}
+			return patch
+		}
+
+		/** The modifiers a shortcut must include at least one of. */
+		const MODIFIERS = ['meta', 'cmd', 'command', 'ctrl', 'control', 'alt', 'option', 'shift']
+
+		/**
+		 * Check a patch before sending it.
+		 *
+		 * The schema only says these fields are strings, so the host would accept
+		 * `"D"` as a shortcut and `"red"` as a colour. The shell rejects both —
+		 * it has to parse the shortcut and apply the colour — but that check lives
+		 * on the far side of a socket, so a bad value would be written and then
+		 * quietly fall back to a default. Refusing it here is the difference
+		 * between an error the user sees and a setting that silently does not
+		 * work.
+		 *
+		 * @param patch - the change about to be sent.
+		 * @returns an error message, or null.
+		 */
+		function problem(patch) {
+			if (typeof patch.hotkey === 'string' && patch.hotkey.trim() !== '') {
+				const parts = patch.hotkey.toLowerCase().split('+').map((part) => part.trim())
+				if (!parts.some((part) => MODIFIERS.includes(part))) return 'config.badHotkey'
+			}
+			for (const name of ['light', 'dark']) {
+				for (const [key, value] of Object.entries(patch[name] ?? {})) {
+					if (!HEX.test(value)) return `config.badColour`
+				}
+			}
+			return null
+		}
+
+		/** One labelled colour input, with the hex shown beside it. */
+		function ColourField({ label, value, onChange }) {
+			return jsx.jsxs('label', {
+				className: 'dsh-shell-field',
+				children: [
+					jsx.jsx('span', { className: 'dsh-shell-field-label', children: label }),
+					jsx.jsxs('span', {
+						className: 'dsh-shell-colour',
+						children: [
+							jsx.jsx('input', {
+								type: 'color',
+								value: HEX.test(value) ? value : '#000000',
+								onChange: (event) => onChange(event.target.value),
+							}),
+							jsx.jsx('code', { children: value }),
+						],
+					}),
+				],
+			})
+		}
+
+		/**
+		 * The DSH Shell configuration form.
+		 *
+		 * Everything the shell's own settings window can change: the summon
+		 * shortcut, both palettes, and the custom CSS. It lives here because a
+		 * second settings window drawn by the shell looked like what it was — a
+		 * different application. The shell keeps its own window as the fallback
+		 * for when DSH will not start.
+		 *
+		 * @returns the form element tree.
+		 */
+		function ConfigSection() {
+			const [loaded, setLoaded] = react.useState(null)
+			const [local, setLocal] = react.useState(null)
+			const [state, setState] = react.useState('loading')
+			const [message, setMessage] = react.useState(null)
+			const [error, setError] = react.useState(null)
+
+			react.useEffect(() => {
+				let live = true
+				call('config', 'GET').then((reply) => {
+					if (!live) return
+					if (reply.ok) {
+						setLoaded(reply.config)
+						setLocal(reply.config)
+						setState('ready')
+					} else {
+						setError(reply.error)
+						setState('unavailable')
+					}
+				})
+				return () => {
+					live = false
+				}
+			}, [])
+
+			if (state === 'loading') {
+				return jsx.jsx('div', { className: 'dsh-shell-config', children: t('config.loading') })
+			}
+			if (state === 'unavailable') {
+				return jsx.jsx('div', {
+					className: 'dsh-shell-config',
+					children: jsx.jsx('div', {
+						className: 'dsh-shell-update-message is-error',
+						children: error ?? t('config.unavailable'),
+					}),
+				})
+			}
+			if (local === null) return null
+
+			const patch = diff(loaded, local)
+			const dirty = Object.keys(patch).length > 0
+
+			const edit = (change) => {
+				setLocal((current) => ({ ...current, ...change }))
+				setMessage(null)
+				setError(null)
+			}
+			const editColour = (name, key, value) => {
+				setLocal((current) => ({
+					...current,
+					[name]: { ...(current[name] ?? {}), [key]: value },
+				}))
+				setMessage(null)
+				setError(null)
+			}
+
+			const save = async () => {
+				const refusal = problem(patch)
+				if (refusal !== null) {
+					setError(t(refusal))
+					return
+				}
+				setState('saving')
+				setError(null)
+				const reply = await call('config', 'POST', patch)
+				if (reply.ok) {
+					// Adopt what the settings service resolved, so the form shows
+					// the stored value rather than the typed one.
+					setLoaded(reply.config)
+					setLocal(reply.config)
+					setState('ready')
+					setMessage(t('config.saved'))
+				} else {
+					setState('ready')
+					setError(reply.error)
+				}
+			}
+
+			const palette = (name) =>
+				jsx.jsxs('div', {
+					className: 'dsh-shell-palette',
+					children: [
+						jsx.jsx('div', {
+							className: 'dsh-shell-subhead',
+							children: t(`config.${name}`),
+						}),
+						...PALETTE_KEYS.filter((key) => local[name]?.[key] !== undefined).map((key) =>
+							jsx.jsx(
+								ColourField,
+								{
+									label: t(`config.colour.${key}`),
+									value: local[name][key],
+									onChange: (value) => editColour(name, key, value),
+								},
+								`${name}.${key}`,
+							),
+						),
+					],
+				})
+
+			return jsx.jsxs('div', {
+				className: 'dsh-shell-config',
+				children: [
+					jsx.jsxs('div', {
+						className: 'dsh-shell-config-head',
+						children: [
+							jsx.jsx('div', { className: 'dsh-shell-subhead', children: t('config.title') }),
+							jsx.jsx('div', {
+								className: 'dsh-shell-update-message',
+								children: t('config.hint'),
+							}),
+						],
+					}),
+					jsx.jsxs('label', {
+						className: 'dsh-shell-field',
+						children: [
+							jsx.jsx('span', {
+								className: 'dsh-shell-field-label',
+								children: t('config.hotkey'),
+							}),
+							jsx.jsxs('span', {
+								className: 'dsh-shell-field-body',
+								children: [
+									jsx.jsx('input', {
+										type: 'text',
+										spellCheck: false,
+										value: local.hotkey ?? '',
+										onChange: (event) => edit({ hotkey: event.target.value }),
+									}),
+									jsx.jsx('span', {
+										className: 'dsh-shell-update-message',
+										children: t('config.hotkeyHint'),
+									}),
+								],
+							}),
+						],
+					}),
+					jsx.jsx('div', {
+						className: 'dsh-shell-palettes',
+						children: [palette('light'), palette('dark')],
+					}),
+					jsx.jsxs('label', {
+						className: 'dsh-shell-field',
+						children: [
+							jsx.jsx('span', {
+								className: 'dsh-shell-field-label',
+								children: t('config.customCss'),
+							}),
+							jsx.jsxs('span', {
+								className: 'dsh-shell-field-body',
+								children: [
+									jsx.jsx('textarea', {
+										rows: 4,
+										spellCheck: false,
+										value: local.customCss ?? '',
+										onChange: (event) => edit({ customCss: event.target.value }),
+									}),
+									jsx.jsx('span', {
+										className: 'dsh-shell-update-message',
+										children: t('config.customCssHint'),
+									}),
+								],
+							}),
+						],
+					}),
+					jsx.jsxs('div', {
+						className: 'dsh-shell-config-actions',
+						children: [
+							jsx.jsx('button', {
+								type: 'button',
+								className: 'primary',
+								disabled: !dirty || state === 'saving',
+								onClick: save,
+								children: state === 'saving' ? t('config.saving') : t('config.save'),
+							}),
+							jsx.jsx('button', {
+								type: 'button',
+								disabled: !dirty || state === 'saving',
+								onClick: () => {
+									setLocal(loaded)
+									setMessage(null)
+									setError(null)
+								},
+								children: t('config.revert'),
+							}),
+							jsx.jsx('span', {
+								className: `dsh-shell-update-message${error ? ' is-error' : ''}`,
+								children: error ?? message ?? (dirty ? t('config.unsaved') : ''),
+							}),
+						],
+					}),
+				],
+			})
+		}
+
+		/**
+		 * The update row: the installed DSH version and the upgrade control.
+		 *
 		 * @returns the row element tree.
 		 */
 		function UpdateSection({ renderSlot }) {
+			const children = [jsx.jsx(ConfigSection, {}, 'config'), UpdateRow()]
+			// The section declares `settings.general.item` as a child slot; render
+			// it or every other plugin's row in this section disappears.
+			if (typeof renderSlot === 'function') {
+				children.push(renderSlot('settings.general.item', {}))
+			}
+			return jsx.jsx('div', { className: 'dsh-shell-row', children })
+		}
+
+		/**
+		 * The version and upgrade row.
+		 *
+		 * @returns the row element tree.
+		 */
+		function UpdateRow() {
 			const [status, setStatus] = react.useState(null)
 			const [busy, setBusy] = react.useState(false)
 			const [error, setError] = react.useState(null)
@@ -229,9 +598,6 @@ window.__ModuleLoader__.load({
 				}),
 			]
 
-			if (typeof renderSlot === 'function') {
-				children.push(renderSlot('settings.general.item', {}))
-			}
 			return jsx.jsx('div', { children })
 		}
 
@@ -247,7 +613,26 @@ window.__ModuleLoader__.load({
 		 * properties so the row follows the theme like everything around it.
 		 */
 		const CSS = `
-.dsh-shell-update-row { display: flex; gap: 16px; padding: 12px 0; border-bottom: 1px solid var(--dsh-border, rgba(128,128,128,.2)); }
+.dsh-shell-row { display: flex; flex-direction: column; gap: 18px; }
+.dsh-shell-subhead { font-weight: 600; margin-bottom: 6px; }
+.dsh-shell-config { display: flex; flex-direction: column; gap: 12px; }
+.dsh-shell-config-head { border-bottom: 1px solid var(--dsh-border, rgba(128,128,128,.2)); padding-bottom: 8px; }
+.dsh-shell-field { display: flex; gap: 16px; align-items: flex-start; }
+.dsh-shell-field-label { flex: 0 0 148px; }
+.dsh-shell-field-body { flex: 1; display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.dsh-shell-field input[type=text], .dsh-shell-field textarea {
+  font: inherit; width: 100%; box-sizing: border-box; padding: 5px 8px;
+  border-radius: 6px; border: 1px solid var(--dsh-border, rgba(128,128,128,.35));
+  background: var(--dsh-surface, transparent); color: inherit;
+}
+.dsh-shell-field textarea { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 12px; resize: vertical; }
+.dsh-shell-palettes { display: flex; gap: 24px; flex-wrap: wrap; }
+.dsh-shell-palette { flex: 1 1 240px; min-width: 200px; }
+.dsh-shell-colour { display: flex; align-items: center; gap: 8px; }
+.dsh-shell-colour input[type=color] { width: 32px; height: 22px; padding: 0; border: 1px solid var(--dsh-border, rgba(128,128,128,.35)); border-radius: 4px; background: none; }
+.dsh-shell-colour code { font-size: 11px; opacity: .7; }
+.dsh-shell-config-actions { display: flex; align-items: center; gap: 8px; }
+.dsh-shell-update-row { display: flex; gap: 16px; padding-top: 12px; border-top: 1px solid var(--dsh-border, rgba(128,128,128,.2)); }
 .dsh-shell-update-label { flex: 0 0 148px; }
 .dsh-shell-update-body { flex: 1; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
 .dsh-shell-update-versions { display: flex; align-items: center; gap: 10px; }
@@ -294,6 +679,11 @@ window.__ModuleLoader__.load({
 		exports.apply = apply
 		exports.inject = inject
 		exports.UpdateSection = UpdateSection
+		// Exported for the test that executes this bundle: the diff decides which
+		// fields a save sends, and sending the wrong ones silently reverts a
+		// setting the form never showed.
+		exports.diff = diff
+		exports.problem = problem
 		return module.exports
 	},
 })

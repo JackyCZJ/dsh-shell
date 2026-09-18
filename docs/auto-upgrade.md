@@ -166,10 +166,44 @@ fake slot registry (`test/client.test.mjs`). That catches a bundle which never
 registers, or registers under the wrong slot — whose only symptom otherwise is a
 settings page that silently shows nothing.
 
+### The configuration moved too
+
+The update row was the first thing to move, but the same argument applied to the
+whole shell configuration, so the plugin also renders the appearance and shortcut
+form: the summon shortcut, both palettes, the custom CSS, and the upgrade
+channel. The shell's own settings window keeps all of it as the fallback.
+
+Two endpoints carry it, on the same route:
+
+```
+GET  /dsh-shell-update/config    the resolved `dsh-shell` section
+POST /dsh-shell-update/config    a patch, merged
+```
+
+The write goes through `settings.update` — the same call the shell's own
+`setConfig` makes — so there is one writer and one validator rather than a second
+path that could disagree.
+
+Three things about this are worth keeping:
+
+- **Only changed fields are sent.** The write is a merge, so resending an
+  untouched field is harmless; sending one the shell did not resolve is not. An
+  older document has no `updateChannel`, and a form that helpfully supplied a
+  default would overwrite the value the shell is actually using.
+- **The schema needed the key added.** `updateChannel` existed on the shell's
+  `Theme` but not in the plugin's `dsh-shell` schema, so a write of it was
+  dropped and the shell's copy silently reverted to the default.
+- **The form validates what the schema does not.** The schema says `hotkey` is a
+  string, so `"D"` is accepted and then fails on the shell side of the socket,
+  where it falls back to the default with no error anywhere. The browser refuses
+  a shortcut with no modifier, and a colour that is not six-digit hex, so the
+  user sees why.
+
 ### What the user sees
 
-- DSH's own General settings: the installed DSH version, the channel, a
-  "Check Now" button, and an "Upgrade to X" button when one exists.
+- DSH's own General settings: the appearance/shortcut form, then the installed
+  DSH version, the channel, a "Check Now" button, and an "Upgrade to X" button
+  when one exists.
 - The shell's settings window: the same, as the fallback when DSH will not start.
 - The tray menu: "Check for DSH Updates…" plus a row showing the version or the
   available update.

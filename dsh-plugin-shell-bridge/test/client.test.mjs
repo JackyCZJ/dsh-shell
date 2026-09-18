@@ -27,6 +27,13 @@ function loadBundle() {
 		createElement: () => ({ id: '', textContent: '' }),
 		head: { appendChild: () => {} },
 	}
+	// The bundle fetches its configuration on mount; a stub keeps the mount
+	// synchronous and side-effect free.
+	globalThis.fetch = async () => ({
+		ok: true,
+		status: 200,
+		json: async () => ({ ok: true, config: { hotkey: 'meta+shift+D', customCss: '' } }),
+	})
 	// eslint-disable-next-line no-new-func -- the bundle is a script, not a module
 	new Function(source)()
 	assert.ok(registered, 'the bundle must call __ModuleLoader__.load')
@@ -36,13 +43,37 @@ function loadBundle() {
 /** The `require` the page's loader provides, limited to what the bundle asks for. */
 function fakeRequire(name) {
 	if (name === 'react') {
+		const cells = []
+		let cursor = 0
 		return {
-			useState: (initial) => [initial, () => {}],
-			useEffect: () => {},
+			__reset: () => {
+				cursor = 0
+			},
+			// Enough of a hook runtime to mount once: state with a working setter,
+			// and effects that run. Anything more faithful is jsdom, not a unit test.
+			useState: (initial) => {
+				const at = cursor
+				cursor += 1
+				if (cells[at] === undefined) cells[at] = initial
+				return [cells[at], (next) => {
+					cells[at] = typeof next === 'function' ? next(cells[at]) : next
+				}]
+			},
+			useEffect: (fn) => {
+				fn()
+			},
 			createElement: () => null,
 		}
 	}
-	if (name === 'react/jsx-runtime') return { jsx: () => null, jsxs: () => null }
+	if (name === 'react/jsx-runtime') {
+		// Record the element names so a test can assert on the tree's shape
+		// without a renderer.
+		return {
+			__elements: [],
+			jsx: (type, props) => ({ type, props }),
+			jsxs: (type, props) => ({ type, props }),
+		}
+	}
 	throw new Error(`the bundle required an unexpected module: ${name}`)
 }
 
@@ -131,4 +162,105 @@ test('the host route path is spelled the same in both halves', async () => {
 		source.includes(`'${UPDATE_ROUTE}'`),
 		`the bundle must call the host's route ${UPDATE_ROUTE}`,
 	)
+})
+
+// --- mounting the row ---------------------------------------------------------
+
+/** Mount the exported section and return the element tree. */
+function mountRow() {
+	const module = loadBundle()
+	const require = fakeRequire('react') && fakeRequire
+	const exports = module.factory(fakeRequire)
+	const { ctx } = fakeContext()
+	exports.apply(ctx)
+	// Rendered without a renderer: this is about whether the component body runs
+	// at all, which is where a typo in a field name or hook order shows up.
+	return exports.UpdateSection({ renderSlot: () => null })
+}
+
+test('the settings row mounts without throwing', () => {
+	const tree = mountRow()
+	assert.ok(tree, 'the row must render something')
+	assert.ok(Array.isArray(tree.props.children), 'the row composes several children')
+})
+
+test('mounting does not lose the child slot', async () => {
+	// The General section declares `settings.general.item` as a child slot.
+	// Failing to render it would silently remove every other plugin's row.
+	const module = loadBundle()
+	const exports = module.factory(fakeRequire)
+	const { ctx } = fakeContext()
+	exports.apply(ctx)
+	let rendered = 0
+	exports.UpdateSection({ renderSlot: () => {
+		rendered += 1
+		return null
+	} })
+	assert.equal(rendered, 1, 'renderSlot must be called exactly once')
+})
+
+test('the diff sends only what changed', () => {
+	const exports = loadBundle().factory(fakeRequire)
+	const base = {
+		hotkey: 'meta+shift+D',
+		customCss: '',
+		updateChannel: 'latest',
+		light: { accent: '#4176e6', background: '#ffffff' },
+		dark: { accent: '#4176e6', background: '#151517' },
+	}
+	assert.deepEqual(exports.diff(base, base), {}, 'an unchanged form sends nothing')
+
+	const edited = {
+		...base,
+		hotkey: 'meta+alt+K',
+		light: { ...base.light, accent: '#ff0000' },
+	}
+	assert.deepEqual(exports.diff(base, edited), {
+		hotkey: 'meta+alt+K',
+		light: { accent: '#ff0000' },
+	})
+})
+
+test('the diff will not send a field the shell never resolved', () => {
+	// An older document has no `updateChannel`. Sending the form's fallback would
+	// overwrite whatever the shell is actually using with a value the user never
+	// saw, so an absent base field means an absent patch field.
+	const exports = loadBundle().factory(fakeRequire)
+	const base = { hotkey: 'meta+shift+D', customCss: '' }
+	const edited = { ...base, updateChannel: 'alpha' }
+	assert.deepEqual(exports.diff(base, edited), {}, 'nothing may be invented')
+})
+
+test('the diff handles a missing palette without throwing', () => {
+	const exports = loadBundle().factory(fakeRequire)
+	assert.deepEqual(exports.diff({ hotkey: 'a' }, { hotkey: 'a' }), {})
+	assert.deepEqual(exports.diff(null, { hotkey: 'a' }), {})
+})
+
+// --- refusing values the schema would accept --------------------------------
+
+test('a shortcut without a modifier is refused before it is sent', () => {
+	// The schema says `hotkey` is a string, so the host accepts "D"; the shell
+	// then cannot parse it and silently falls back to the default. Refusing here
+	// is what turns that into something the user sees.
+	const { problem } = loadBundle().factory(fakeRequire)
+	assert.equal(problem({ hotkey: 'D' }), 'config.badHotkey')
+	assert.equal(problem({ hotkey: 'shift+D' }), null)
+	assert.equal(problem({ hotkey: 'meta+alt+K' }), null)
+	assert.equal(problem({ hotkey: 'Cmd+Shift+P' }), null, 'cmd is a modifier too')
+	assert.equal(problem({ hotkey: '' }), null, 'empty is not this check\u2019s business')
+	assert.equal(problem({}), null)
+})
+
+test('a colour that is not six-digit hex is refused', () => {
+	const { problem } = loadBundle().factory(fakeRequire)
+	assert.equal(problem({ light: { accent: 'red' } }), 'config.badColour')
+	assert.equal(problem({ dark: { background: '#fff' } }), 'config.badColour')
+	assert.equal(problem({ light: { accent: '#4176e6' } }), null)
+})
+
+test('a patch with nothing to check passes', () => {
+	const { problem } = loadBundle().factory(fakeRequire)
+	assert.equal(problem({ customCss: 'body { color: red; }' }), null)
+	assert.equal(problem({ updateChannel: 'alpha' }), null)
 })

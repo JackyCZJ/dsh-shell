@@ -292,6 +292,7 @@ export const SHELL_SETTINGS_DEFAULTS = deepFreeze({
     accent: '#4176e6',
   },
   customCss: '',
+  updateChannel: 'latest',
 })
 
 /**
@@ -366,6 +367,12 @@ export function defineShellSettingsSchema(z) {
     light: palette().default({ ...SHELL_SETTINGS_DEFAULTS.light }),
     dark: palette().default({ ...SHELL_SETTINGS_DEFAULTS.dark }),
     customCss: z.string().default(SHELL_SETTINGS_DEFAULTS.customCss),
+    // Which DSH release line to upgrade along. Declared here because the shell
+    // reads it from this document: without a schema field the key is dropped on
+    // write and the shell's copy silently reverts to the default.
+    updateChannel: z
+      .union([z.const('latest'), z.const('alpha')])
+      .default(SHELL_SETTINGS_DEFAULTS.updateChannel),
   })
 }
 
@@ -431,7 +438,7 @@ function installShellSettings(ctx, settingsCtx, link, log) {
     console.log(
       '[dsh-plugin-shell-bridge] schemastery not resolvable; dsh-shell settings stay static',
     )
-    return
+    return undefined
   }
 
   const settings = settingsCtx.settings
@@ -466,6 +473,19 @@ function installShellSettings(ctx, settingsCtx, link, log) {
     console.log(
       `[dsh-plugin-shell-bridge] settings registration failed: ${error?.message ?? error}`,
     )
+  }
+
+  // A read/write handle for the browser half.
+  //
+  // The write goes through the same `settings.update` the shell's own
+  // `setConfig` uses, so there is exactly one writer and one validator. Reading
+  // goes through `source`, which is the resolved section while the settings
+  // service is mounted and the composition defaults when it is not — so the
+  // form shows what the shell is actually using, not what a file happens to
+  // contain.
+  return {
+    read: () => source(),
+    write: (patch) => settings.update(SETTINGS_NAMESPACE, patch),
   }
 }
 
@@ -766,6 +786,46 @@ function createShellService(link) {
   }
 }
 
+/** Cap on a settings request body; a config document is a few KB at most. */
+const MAX_BODY_BYTES = 256 * 1024
+
+/**
+ * Read and parse a JSON request body.
+ *
+ * Bounded on purpose: this route is reachable without a session token, so an
+ * unbounded read would be a memory hole. A body that is too large or not JSON is
+ * a normal refusal, not a throw.
+ *
+ * @param {import('node:http').IncomingMessage} req - the request.
+ * @returns {Promise<{ok: true, value: unknown} | {ok: false, error: string}>}
+ */
+function readJsonBody(req) {
+  return new Promise((resolve) => {
+    const chunks = []
+    let size = 0
+    req.on('data', (chunk) => {
+      size += chunk.length
+      if (size > MAX_BODY_BYTES) {
+        resolve({ ok: false, error: 'request body too large' })
+        req.destroy()
+        return
+      }
+      chunks.push(chunk)
+    })
+    req.on('error', (error) => resolve({ ok: false, error: error?.message ?? String(error) }))
+    req.on('end', () => {
+      if (size > MAX_BODY_BYTES) return
+      const text = Buffer.concat(chunks).toString('utf8')
+      if (text.trim() === '') return resolve({ ok: true, value: {} })
+      try {
+        resolve({ ok: true, value: JSON.parse(text) })
+      } catch (error) {
+        resolve({ ok: false, error: `malformed JSON body: ${error?.message ?? error}` })
+      }
+    })
+  })
+}
+
 /**
  * Build the update route the browser half calls.
  *
@@ -778,9 +838,12 @@ function createShellService(link) {
  * already do — install a published DSH, or read a version string.
  *
  * @param {ReturnType<typeof createShellService>} shell - the shell service.
+ * @param {object} [config] - read/write handle for the `dsh-shell` settings
+ *   namespace; absent when the settings service is unavailable, in which case
+ *   the configuration actions report that instead of failing opaquely.
  * @returns {{kind: string, path: string, handler: Function}} a route.
  */
-export function createUpdateRoute(shell) {
+export function createUpdateRoute(shell, config) {
   return {
     kind: 'prefix',
     path: UPDATE_ROUTE,
@@ -812,6 +875,34 @@ export function createUpdateRoute(shell) {
           // Deliberately not awaited to completion: the install replaces the
           // running host, so waiting would be waiting on this process dying.
           return send(200, await shell.installUpdate())
+        }
+        if (action === 'config' && req.method === 'GET') {
+          if (config === undefined) {
+            return send(503, { ok: false, error: 'the settings service is not mounted' })
+          }
+          // A fresh object each time: the resolved section may be frozen, and the
+          // caller must not be able to mutate the shell's live copy.
+          return send(200, { ok: true, config: JSON.parse(JSON.stringify(config.read())) })
+        }
+        if (action === 'config' && req.method === 'POST') {
+          if (config === undefined) {
+            return send(503, { ok: false, error: 'the settings service is not mounted' })
+          }
+          const body = await readJsonBody(req)
+          if (!body.ok) return send(400, { ok: false, error: body.error })
+          if (body.value === null || typeof body.value !== 'object' || Array.isArray(body.value)) {
+            return send(400, { ok: false, error: 'the body must be a config object' })
+          }
+          try {
+            // Merge, exactly as the shell's own `setConfig` does: keys the form
+            // omits keep whatever the user already had.
+            await config.write(body.value)
+            return send(200, { ok: true, config: JSON.parse(JSON.stringify(config.read())) })
+          } catch (error) {
+            // A validation refusal is a normal outcome for a UI write; the
+            // message comes from the schema and is what the user needs to see.
+            return send(200, { ok: false, error: error?.message ?? String(error) })
+          }
         }
         return send(404, { ok: false, error: `no such action: ${action}` })
       } catch (error) {
@@ -859,7 +950,17 @@ export function apply(ctx) {
   ctx.inject(['webServer'], (webCtx) => {
     const webServer = webCtx.webServer
     if (webServer === undefined || typeof webServer.register !== 'function') return
-    const route = createUpdateRoute(shellService)
+    const route = createUpdateRoute(shellService, {
+      // Read through a getter: the settings injection may land after the route
+      // is registered, and a captured `undefined` would freeze that in.
+      read: () => shellConfig?.read() ?? SHELL_SETTINGS_DEFAULTS,
+      write: (patch) => {
+        if (shellConfig === undefined) {
+          return Promise.reject(new Error('the DSH settings service is not mounted'))
+        }
+        return shellConfig.write(patch)
+      },
+    })
     if (typeof webCtx.effect === 'function') {
       webCtx.effect(() => webServer.register(route), 'shell-bridge: update route')
     } else {
@@ -906,7 +1007,11 @@ export function apply(ctx) {
   // Register the namespace through the optional-service wiring: with no
   // settings provider the plugin boots unchanged, the service is simply absent,
   // and the shell is told its writes are unavailable.
+  // The handle is kept so the HTTP route can serve the same namespace. Declared
+  // before the injection because the route is registered by a different
+  // injection and may run either side of this one.
+  let shellConfig
   ctx.inject(['settings'], (settingsCtx) => {
-    installShellSettings(ctx, settingsCtx, link, log)
+    shellConfig = installShellSettings(ctx, settingsCtx, link, log)
   })
 }

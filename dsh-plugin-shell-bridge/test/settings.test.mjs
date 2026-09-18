@@ -56,6 +56,7 @@ const DOCUMENTED = {
     accent: '#4176e6',
   },
   customCss: '',
+  updateChannel: 'latest',
 }
 
 /**
